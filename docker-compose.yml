@@ -1,0 +1,12 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    volumes:
+      # Persist downloaded models on the host
+      - ./backend/models:/app/models
+    environment:
+      - PYTHONUNBUFFERED=1
