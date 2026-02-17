@@ -46,7 +46,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -148,6 +148,14 @@ async def websocket_endpoint(websocket: WebSocket):
                          await websocket.send_json({"error": "TTS Engine not initialized"})
                          continue
 
+                    # Ensure voice is valid for the loaded voice pack.
+                    try:
+                        available = app.state.tts.list_voices()
+                        if available and voice not in available:
+                            voice = available[0]
+                    except Exception:
+                        pass
+
                     # Stream audio
                     try:
                         async for _, audio_chunk in app.state.tts.generate_audio_stream(
@@ -185,6 +193,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     paused = False
 
                     logger.info(f"Play request: url={url} voice={voice} speed={speed}")
+
+                    # Ensure voice is valid for the loaded voice pack.
+                    try:
+                        available = app.state.tts.list_voices()
+                        if available and voice not in available:
+                            voice = available[0]
+                    except Exception:
+                        pass
                     try:
                         chapter = await app.state.scraper.scrape_chapter(url)
                     except Exception as e:

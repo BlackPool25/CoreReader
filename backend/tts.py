@@ -9,9 +9,14 @@ import inspect
 from typing import AsyncIterator, Iterable, List, Optional
 import contextlib
 from pathlib import Path
+import zipfile
 
 class TTSEngine:
-    def __init__(self, model_path="models/kokoro-v0_19.onnx", voices_path="models/voices.npz"):
+    def __init__(
+        self,
+        model_path: str = "models/kokoro-v1.0.onnx",
+        voices_path: str = "models/voices-v1.0.bin",
+    ):
         # Ensure models exist
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found at {model_path}. Run download_models.py first.")
@@ -19,9 +24,9 @@ class TTSEngine:
         self.model_path = model_path
         self.voices_path = voices_path
 
-        # kokoro_onnx loads voices via np.load(), so we must provide a NumPy file.
-        # If only voices.json exists, convert it to voices.npz (no pickle).
-        self._ensure_voices_numpy_file()
+        # Newer kokoro-onnx versions support the v1.0 voices bundle (voices-v1.0.bin).
+        # We also keep backward-compatible support for voices.json/voices.npz.
+        self._ensure_voices_file()
 
         self.sample_rate = 24000  # Kokoro default
         self._voices_cache: Optional[List[str]] = None
@@ -42,7 +47,20 @@ class TTSEngine:
 
         p = Path(self.voices_path)
         voices: List[str] = []
-        if p.suffix == ".npz":
+        if p.suffix == ".bin":
+            # voices-v1.0.bin is a zip containing <voice_id>.npy entries.
+            try:
+                with zipfile.ZipFile(str(p), "r") as z:
+                    for name in z.namelist():
+                        if not name.endswith(".npy"):
+                            continue
+                        voice_id = name[: -len(".npy")]
+                        if voice_id:
+                            voices.append(voice_id)
+            except zipfile.BadZipFile as e:
+                raise ValueError(f"Invalid voices bundle (expected zip): {p}") from e
+            voices = sorted(set(voices))
+        elif p.suffix == ".npz":
             # np.load returns an NpzFile mapping of arrays.
             with np.load(str(p)) as z:
                 voices = sorted(list(z.files))
@@ -57,33 +75,24 @@ class TTSEngine:
         self._voices_cache = voices
         return voices
 
-    def _ensure_voices_numpy_file(self) -> None:
+    def _ensure_voices_file(self) -> None:
         p = Path(self.voices_path)
-        if p.exists() and p.suffix in {".npz", ".npy"}:
+        if p.exists() and p.suffix in {".bin", ".npz", ".npy", ".json"}:
             return
 
-        # If configured voices_path doesn't exist, try common fallbacks.
-        candidate_json = Path("models/voices.json")
-        candidate_npz = Path("models/voices.npz")
-
-        if candidate_npz.exists():
-            self.voices_path = str(candidate_npz)
-            return
-
-        if candidate_json.exists():
-            # Convert JSON -> NPZ
-            with candidate_json.open("r", encoding="utf-8") as f:
-                voices = json.load(f)
-            if not isinstance(voices, dict):
-                raise ValueError("voices.json expected to be a dict")
-            arrays = {k: np.asarray(v, dtype=np.float32) for k, v in voices.items()}
-            candidate_npz.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(str(candidate_npz), **arrays)
-            self.voices_path = str(candidate_npz)
-            return
+        # Try common fallbacks in models/.
+        candidates = [
+            Path("models/voices-v1.0.bin"),
+            Path("models/voices.npz"),
+            Path("models/voices.json"),
+        ]
+        for c in candidates:
+            if c.exists():
+                self.voices_path = str(c)
+                return
 
         raise FileNotFoundError(
-            f"Voices file not found. Expected {self.voices_path} (npz/npy) or models/voices.json"
+            f"Voices file not found. Expected {self.voices_path} or one of: {', '.join(str(c) for c in candidates)}"
         )
 
     def split_sentences(self, text: str) -> List[str]:

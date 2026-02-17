@@ -1,4 +1,4 @@
-# LN-TTS (NovelCool → Local TTS → Flutter Player)
+# LN-TTS (Backend Scrape + TTS → Flutter Player)
 
 This repo contains:
 - `backend/`: FastAPI WebSocket server (scrape chapter text + stream PCM audio from local TTS)
@@ -44,6 +44,10 @@ uv sync
 ```bash
 python download_models.py
 ```
+
+Downloads:
+- `models/kokoro-v1.0.onnx`
+- `models/voices-v1.0.bin`
 
 ### 3) Run the server (local)
 
@@ -111,11 +115,31 @@ flutter run
 
 > Note: This project is intended for personal/local use.
 
-## Android note
+## Backend required (Android/Web/Desktop)
 
-The Flutter Android app can run fully on-device (no backend server required):
-- Scrapes NovelCool directly in-app
-- Runs Kokoro ONNX locally via ONNX Runtime
-- Downloads the (int8) model + voices on first use and stores them in app storage
+The frontend is a thin UI/player. Scraping and TTS always run in the backend.
 
-You can still use the Python backend mode on desktop/web if you want streaming over LAN.
+1) On the PC:
+- `docker compose up -d --build`
+- Confirm backend is reachable: `http://127.0.0.1:8000/health`
+
+2) On the phone (CoreReader):
+- Settings → set **WebSocket base URL** to: `ws://<PC_LAN_IP>:8000`
+  - Example: `ws://192.168.29.101:8000`
+
+Notes:
+- Make sure your firewall allows inbound TCP 8000.
+- Use the PC's LAN IP (not `localhost`).
+
+### Flutter Web note
+
+- If the web app is served over `https://`, browsers will usually require `wss://` (secure websockets).
+- If you run the web app over plain `http://` (debug/dev), `ws://` is fine.
+
+## Data flow (high level)
+
+- Frontend (Flutter) calls backend `GET /voices` to populate the voice list.
+- Frontend opens `WS /ws` and sends `{ "command": "play", "url": <chapter_url>, "voice": <id>, "speed": <x> }`.
+- Backend scrapes the chapter, emits a `chapter_info` JSON message (paragraphs + audio format), then streams PCM16 audio frames.
+- Backend emits `sentence` JSON messages for highlighting.
+- Frontend can send `{ "command": "pause" }`, `{ "command": "resume" }`, `{ "command": "stop" }` during playback.

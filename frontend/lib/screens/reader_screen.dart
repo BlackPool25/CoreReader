@@ -7,21 +7,18 @@ import 'package:http/http.dart' as http;
 
 import '../services/reader_controller_factory.dart';
 import '../services/reader_stream_controller.dart';
-import '../services/local_defaults.dart';
-import '../services/novel_index_resolver.dart';
 import '../services/settings_store.dart';
 import '../widgets/glass_container.dart';
-import '../services/local_voice_list.dart';
 import 'highlight_in_paragraph.dart';
 
 class ReaderScreen extends StatefulWidget {
   const ReaderScreen({super.key});
 
   @override
-  State<ReaderScreen> createState() => _ReaderScreenState();
+  State<ReaderScreen> createState() => ReaderScreenState();
 }
 
-class _ReaderScreenState extends State<ReaderScreen> {
+class ReaderScreenState extends State<ReaderScreen> {
   final _novelController = TextEditingController(
     text: 'https://www.novelcool.com/novel/Shadow-Slave.html',
   );
@@ -31,11 +28,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   late ReaderStreamController _stream;
   StreamSubscription? _sub;
-
-  bool _useLocalTts = false;
-
-  final NovelIndexResolver _indexResolver = NovelIndexResolver();
-  NovelIndex? _localIndex;
 
   List<String> _voices = const ['af_bella'];
   String _voice = 'af_bella';
@@ -63,18 +55,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   bool _busy = false;
 
-  void _applyModeDefaults() {
-    if (_useLocalTts) {
-      // Local Kokoro runs from assets; voices will be loaded from assets/voices.json.
-      _voices = const ['af_heart'];
-      _voice = 'af_heart';
-      return;
-    }
-    // Backend mode defaults; voices list will be refreshed from /voices.
-    _voices = const ['af_bella'];
-    _voice = 'af_bella';
-  }
-
   void _showError(Object e) {
     final raw = e.toString();
     var msg = raw;
@@ -82,6 +62,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
       msg = 'Network/DNS error while fetching NovelCool. Check your internet connection.';
     } else if (raw.contains('SocketException')) {
       msg = 'Network error. Check your internet connection.';
+    } else if (raw.contains('Connection refused') || raw.contains('timed out')) {
+      msg = 'Could not reach backend. Check Settings → Server URL (use ws://<PC_LAN_IP>:8000).';
     }
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
@@ -90,44 +72,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void initState() {
     super.initState();
-    _useLocalTts = defaultUseLocalTts();
-    _applyModeDefaults();
-    _stream = createReaderController(useLocalTts: _useLocalTts);
+    _stream = createReaderController();
     _sub = _stream.events.listen(_onEvent);
-    unawaited(_loadUseLocalTtsAndMaybeSwitch());
     unawaited(_loadVoices());
     unawaited(_loadFontSize());
   }
 
   Future<void> refreshFromSettings() async {
-    await _loadUseLocalTtsAndMaybeSwitch();
     await _loadVoices();
     await _loadFontSize();
-  }
-
-  Future<void> _loadUseLocalTtsAndMaybeSwitch() async {
-    final v = await SettingsStore.getUseLocalTts();
-    if (!mounted) return;
-
-    final desired = createReaderController(useLocalTts: v);
-    if (desired.runtimeType == _stream.runtimeType) {
-      await desired.dispose();
-      setState(() {
-        _useLocalTts = v;
-        _applyModeDefaults();
-      });
-      return;
-    }
-
-    await _sub?.cancel();
-    await _stream.dispose();
-    _stream = desired;
-    _sub = _stream.events.listen(_onEvent);
-    if (!mounted) return;
-    setState(() {
-      _useLocalTts = v;
-      _applyModeDefaults();
-    });
   }
 
   Future<void> _loadFontSize() async {
@@ -138,6 +91,16 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   void _onEvent(Map<String, dynamic> e) {
     final type = e['type'];
+    if (type == 'voices') {
+      final list = (e['voices'] as List?)?.map((x) => x.toString()).toList() ?? const <String>[];
+      if (list.isNotEmpty) {
+        setState(() {
+          _voices = list;
+          if (!_voices.contains(_voice)) _voice = _voices.first;
+        });
+      }
+      return;
+    }
     if (type == 'chapter_info') {
       final paras = (e['paragraphs'] as List?)?.map((x) => x.toString()).toList() ?? const <String>[];
       setState(() {
@@ -167,23 +130,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
         _sentence = s;
         if (idx >= 0) _currentParagraphIndex = idx;
       });
-
-      // Auto-scroll to the paragraph that contains the current sentence.
-      if (_sentence.isNotEmpty) {
-        if (idx >= 0 && idx < _paraKeys.length) {
-          final ctx = _paraKeys[idx].currentContext;
-          if (ctx != null) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              Scrollable.ensureVisible(
-                ctx,
-                duration: const Duration(milliseconds: 250),
-                curve: Curves.easeOut,
-                alignment: 0.2,
-              );
-            });
-          }
-        }
-      }
       return;
     }
 
@@ -204,15 +150,13 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   Future<void> _loadVoices() async {
-    if (_useLocalTts) {
-      await _loadLocalVoices();
-      return;
-    }
     try {
       final base = await SettingsStore.getServerBaseUrl();
       final uri = SettingsStore.httpUri(base, '/voices');
-      final res = await http.get(uri);
-      if (res.statusCode != 200) return;
+      final res = await http.get(uri).timeout(const Duration(seconds: 10));
+      if (res.statusCode != 200) {
+        throw Exception('Backend /voices failed (${res.statusCode})');
+      }
       final decoded = jsonDecode(res.body);
       if (decoded is Map && decoded['voices'] is List) {
         final voices = (decoded['voices'] as List).map((e) => e.toString()).toList();
@@ -223,24 +167,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
           });
         }
       }
-    } catch (_) {
-      // ignore; allow offline UI
-    }
-  }
-
-  Future<void> _loadLocalVoices() async {
-    try {
-      final keys = await loadLocalVoiceIds();
-      if (keys.isEmpty) return;
-      if (!mounted) return;
-      setState(() {
-        _voices = keys;
-        if (!_voices.contains(_voice)) {
-          _voice = _voices.first;
-        }
-      });
     } catch (e) {
-      // If assets are missing, surface a clear message.
       _showError(e);
     }
   }
@@ -273,28 +200,13 @@ class _ReaderScreenState extends State<ReaderScreen> {
   Future<void> _loadChapters() async {
     setState(() => _busy = true);
     try {
-      if (_useLocalTts) {
-        final novelUrl = _novelController.text.trim();
-        final idx = await _indexResolver.load(novelUrl);
-        if (idx.count <= 0) throw Exception('No chapters found');
-        final firstUrl = idx.urlForChapterNum(1);
-        if (firstUrl == null || firstUrl.isEmpty) throw Exception('Could not resolve chapter 1');
-        setState(() {
-          _localIndex = idx;
-          _chapterCount = idx.count;
-          _selectedChapterNum = 1;
-          _chapterRangeStart = 1;
-          _urlController.text = firstUrl;
-          _busy = false;
-        });
-        return;
-      }
+      final novelUrl = _novelController.text.trim();
 
       final base = await SettingsStore.getServerBaseUrl();
       final metaUri = SettingsStore.httpUri(base, '/novel_meta').replace(
-        queryParameters: {'url': _novelController.text.trim()},
+        queryParameters: {'url': novelUrl},
       );
-      final metaRes = await http.get(metaUri);
+      final metaRes = await http.get(metaUri).timeout(const Duration(seconds: 25));
       if (metaRes.statusCode != 200) throw Exception('Failed to load chapter count');
       final decoded = jsonDecode(metaRes.body);
       final count = (decoded is Map ? decoded['count'] : null);
@@ -322,19 +234,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
       _selectedChapterNum = n;
     });
     try {
-      if (_useLocalTts) {
-        final novelUrl = _novelController.text.trim();
-        final idx = _localIndex ?? await _indexResolver.load(novelUrl);
-        final url = idx.urlForChapterNum(n);
-        if (url == null || url.isEmpty) throw Exception('Could not resolve chapter $n');
-        setState(() {
-          _localIndex = idx;
-          _urlController.text = url;
-          _busy = false;
-        });
-        return;
-      }
-
       final base = await SettingsStore.getServerBaseUrl();
       final uri = SettingsStore.httpUri(base, '/novel_chapter').replace(
         queryParameters: {
@@ -342,7 +241,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
           'n': n.toString(),
         },
       );
-      final res = await http.get(uri);
+      final res = await http.get(uri).timeout(const Duration(seconds: 25));
       if (res.statusCode != 200) throw Exception('Failed to resolve chapter URL');
       final decoded = jsonDecode(res.body);
       final url = (decoded is Map ? decoded['url'] : null)?.toString() ?? '';

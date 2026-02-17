@@ -40,11 +40,6 @@ dependencies:
   shared_preferences: ^2.5.3
   http: ^1.2.2
 
-  kokoro_tts_flutter: ^0.2.0+1
-  flutter_onnxruntime: ^1.6.2
-  html: ^0.15.6
-  path_provider: ^2.1.5
-  archive: ^4.0.7
 
 dev_dependencies:
   flutter_test:
@@ -74,8 +69,7 @@ flutter:
     - assets/lexicon.json
     - assets/us_gold.json
     - assets/us_silver.json
-    - packages/malsami/assets/us_gold.json
-    - packages/malsami/assets/us_silver.json
+
 
   # To add assets to your application, add an assets section, like this:
   # assets:

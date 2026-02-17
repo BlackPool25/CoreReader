@@ -55,8 +55,8 @@ class NovelStreamController implements ReaderStreamController {
   Future<void> primeAudio({int sampleRate = 24000}) async {
     try {
       await _ensureAudioStream(sampleRate);
-    } catch (_) {
-      // ignore; connection path will surface errors
+    } catch (e) {
+      _eventsController.add({'type': 'error', 'message': 'Audio init failed: ${e.toString()}'});
     }
   }
 
@@ -128,7 +128,11 @@ class NovelStreamController implements ReaderStreamController {
             if (obj['type'] == 'chapter_info') {
               final audio = (obj['audio'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
               final sampleRate = (audio['sample_rate'] as num?)?.toInt() ?? 24000;
-              await _ensureAudioStream(sampleRate);
+              try {
+                await _ensureAudioStream(sampleRate);
+              } catch (e) {
+                _eventsController.add({'type': 'error', 'message': 'Audio init failed: ${e.toString()}'});
+              }
             }
             if (obj['type'] == 'chapter_complete') {
               if (_audioSource != null) {
@@ -146,7 +150,12 @@ class NovelStreamController implements ReaderStreamController {
         if (bytes == null) return;
 
         // If we haven't received chapter_info yet, default to 24k.
-        await _ensureAudioStream(_streamSampleRate ?? 24000);
+        try {
+          await _ensureAudioStream(_streamSampleRate ?? 24000);
+        } catch (e) {
+          _eventsController.add({'type': 'error', 'message': 'Audio init failed: ${e.toString()}'});
+          return;
+        }
         if (_audioSource != null) {
           try {
             _soloud.addAudioDataStream(_audioSource!, bytes);

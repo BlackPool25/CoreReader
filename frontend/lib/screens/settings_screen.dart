@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 
 import '../services/settings_store.dart';
 import '../widgets/glass_container.dart';
@@ -15,7 +14,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _controller = TextEditingController();
   bool _loading = true;
   double _fontSize = 16.0;
-  bool _useLocalTts = false;
 
   @override
   void initState() {
@@ -27,7 +25,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final base = await SettingsStore.getServerBaseUrl();
     _controller.text = base;
     _fontSize = await SettingsStore.getReaderFontSize();
-    _useLocalTts = await SettingsStore.getUseLocalTts();
     setState(() => _loading = false);
   }
 
@@ -36,7 +33,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (value.isEmpty) return;
     await SettingsStore.setServerBaseUrl(value);
     await SettingsStore.setReaderFontSize(_fontSize);
-    await SettingsStore.setUseLocalTts(_useLocalTts);
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Saved settings')),
@@ -73,21 +69,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         hintText: 'ws://192.168.1.45:8000',
                         border: OutlineInputBorder(),
                       ),
-                    ),
-                    const SizedBox(height: 12),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text(
-                        'On-device TTS (Android)',
-                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                      ),
-                      subtitle: Text(
-                        kIsWeb
-                            ? 'Not supported on Web'
-                            : 'Uses Kokoro ONNX locally. Restart the app after changing.',
-                      ),
-                      value: _useLocalTts,
-                      onChanged: kIsWeb ? null : (v) => setState(() => _useLocalTts = v),
                     ),
                     const SizedBox(height: 12),
                       const Text(
