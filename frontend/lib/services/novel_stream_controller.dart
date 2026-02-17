@@ -39,6 +39,9 @@ class NovelStreamController implements ReaderStreamController {
   SoundHandle? _handle;
   int? _streamSampleRate;
 
+  Timer? _noAudioTimer;
+  bool _receivedAnyAudio = false;
+
   bool _connected = false;
   @override
   bool get connected => _connected;
@@ -56,8 +59,17 @@ class NovelStreamController implements ReaderStreamController {
     try {
       await _ensureAudioStream(sampleRate);
     } catch (e) {
-      _eventsController.add({'type': 'error', 'message': 'Audio init failed: ${e.toString()}'});
+      _eventsController.add({'type': 'error', 'message': _formatAudioInitError(e)});
     }
+  }
+
+  String _formatAudioInitError(Object e) {
+    final raw = e.toString();
+    // Common Flutter Web failure from WASM worker/audio worklet initialization.
+    if (raw.contains('createWorkerInWasm') || raw.contains('SharedArrayBuffer')) {
+      return 'Audio init failed on Web. This usually requires cross-origin isolation headers (COOP/COEP) or a non-dev server. Raw: $raw';
+    }
+    return 'Audio init failed: $raw';
   }
 
   @override
@@ -93,7 +105,8 @@ class NovelStreamController implements ReaderStreamController {
       channels: Channels.mono,
       format: BufferType.s16le,
       bufferingType: BufferingType.released,
-      bufferingTimeNeeds: 0.25,
+      // More headroom reduces audible gaps when synthesis/network jitter occurs.
+      bufferingTimeNeeds: 1.0,
       maxBufferSizeDuration: const Duration(minutes: 30),
     );
     final handle = await _soloud.play(src);
@@ -119,6 +132,17 @@ class NovelStreamController implements ReaderStreamController {
     _connected = true;
     _paused = false;
 
+    _receivedAnyAudio = false;
+    _noAudioTimer?.cancel();
+    _noAudioTimer = Timer(const Duration(seconds: 6), () {
+      if (_connected && !_receivedAnyAudio) {
+        _eventsController.add({
+          'type': 'error',
+          'message': 'No audio frames received from backend. Check Server URL and backend logs.',
+        });
+      }
+    });
+
     _subscription = _channel!.stream.listen(
       (event) async {
         if (event is String) {
@@ -131,7 +155,7 @@ class NovelStreamController implements ReaderStreamController {
               try {
                 await _ensureAudioStream(sampleRate);
               } catch (e) {
-                _eventsController.add({'type': 'error', 'message': 'Audio init failed: ${e.toString()}'});
+                _eventsController.add({'type': 'error', 'message': _formatAudioInitError(e)});
               }
             }
             if (obj['type'] == 'chapter_complete') {
@@ -149,11 +173,13 @@ class NovelStreamController implements ReaderStreamController {
         final bytes = await wsBinaryToBytes(event);
         if (bytes == null) return;
 
+        _receivedAnyAudio = true;
+
         // If we haven't received chapter_info yet, default to 24k.
         try {
           await _ensureAudioStream(_streamSampleRate ?? 24000);
         } catch (e) {
-          _eventsController.add({'type': 'error', 'message': 'Audio init failed: ${e.toString()}'});
+          _eventsController.add({'type': 'error', 'message': _formatAudioInitError(e)});
           return;
         }
         if (_audioSource != null) {
@@ -209,6 +235,8 @@ class NovelStreamController implements ReaderStreamController {
 
   @override
   Future<void> stop() async {
+    _noAudioTimer?.cancel();
+    _noAudioTimer = null;
     if (_channel != null) {
       try {
         _channel!.sink.add(jsonEncode({'command': 'stop'}));

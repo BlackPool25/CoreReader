@@ -136,6 +136,14 @@ Notes:
 - If the web app is served over `https://`, browsers will usually require `wss://` (secure websockets).
 - If you run the web app over plain `http://` (debug/dev), `ws://` is fine.
 
+Audio on Flutter Web with `flutter_soloud` may require cross-origin isolation headers (COOP/COEP). If you see errors mentioning `createWorkerInWasm` or `SharedArrayBuffer`, run with headers (Flutter versions that support it):
+
+```bash
+flutter run -d chrome --web-port 3000 \
+  --web-header="Cross-Origin-Opener-Policy=same-origin" \
+  --web-header="Cross-Origin-Embedder-Policy=require-corp"
+```
+
 ## Data flow (high level)
 
 - Frontend (Flutter) calls backend `GET /voices` to populate the voice list.

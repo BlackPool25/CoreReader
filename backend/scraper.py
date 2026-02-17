@@ -123,17 +123,16 @@ class NovelCoolScraper:
             if not title:
                 # Some chapter links have empty text (icons). Skip.
                 continue
-            links.append({"title": title, "url": abs_url})
+            # Best-effort chapter number parsing.
+            m = re.search(r"(?:Chapter|C)\s*(\d+)", title, flags=re.IGNORECASE)
+            n = int(m.group(1)) if m else None
+            links.append({"n": n, "title": title, "url": abs_url})
 
         # Sort by chapter number when possible.
         def chapter_key(item):
-            t = item.get('title', '')
-            m = re.search(r"(?:Chapter|C)\s*(\d+)", t, flags=re.IGNORECASE)
-            if m:
-                try:
-                    return int(m.group(1))
-                except Exception:
-                    return 10**9
+            n = item.get('n')
+            if isinstance(n, int):
+                return n
             # fallback: keep stable ordering
             return 10**9
 

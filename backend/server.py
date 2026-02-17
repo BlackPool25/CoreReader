@@ -97,15 +97,42 @@ async def _get_cached_novel_index(novel_url: str):
 @app.get("/novel_meta")
 async def novel_meta(url: str):
     chapters = await _get_cached_novel_index(url)
-    return {"count": len(chapters)}
+    max_n = 0
+    for c in chapters:
+        try:
+            n = c.get("n") if isinstance(c, dict) else None
+            if isinstance(n, int) and n > max_n:
+                max_n = n
+        except Exception:
+            pass
+    return {"count": max_n if max_n > 0 else len(chapters)}
 
 
 @app.get("/novel_chapter")
 async def novel_chapter(url: str, n: int):
     chapters = await _get_cached_novel_index(url)
-    if n < 1 or n > len(chapters):
-        raise HTTPException(status_code=400, detail=f"chapter n must be between 1 and {len(chapters)}")
-    item = chapters[n - 1] or {}
+    # Prefer resolving by parsed chapter number, not list position.
+    resolved: dict | None = None
+    max_n = 0
+    for c in chapters:
+        if not isinstance(c, dict):
+            continue
+        cn = c.get("n")
+        if isinstance(cn, int) and cn > max_n:
+            max_n = cn
+        if isinstance(cn, int) and cn == n:
+            resolved = c
+            break
+
+    limit = max_n if max_n > 0 else len(chapters)
+    if n < 1 or n > limit:
+        raise HTTPException(status_code=400, detail=f"chapter n must be between 1 and {limit}")
+
+    if resolved is None:
+        # Fallback: old positional behavior.
+        item = chapters[n - 1] if (n - 1) < len(chapters) else {}
+    else:
+        item = resolved
     return {"n": n, "title": item.get("title"), "url": item.get("url")}
 
 @app.websocket("/ws")

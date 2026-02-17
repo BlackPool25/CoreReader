@@ -19,6 +19,7 @@ class ReaderScreen extends StatefulWidget {
 }
 
 class ReaderScreenState extends State<ReaderScreen> {
+  static const int _ttsPrefetchSentences = 8;
   final _novelController = TextEditingController(
     text: 'https://www.novelcool.com/novel/Shadow-Slave.html',
   );
@@ -175,7 +176,12 @@ class ReaderScreenState extends State<ReaderScreen> {
   Future<void> _playUrl(String url) async {
     setState(() => _busy = true);
     await _stream.primeAudio();
-    await _stream.connectAndPlay(url: url, voice: _voice, speed: _speed);
+    await _stream.connectAndPlay(
+      url: url,
+      voice: _voice,
+      speed: _speed,
+      prefetch: _ttsPrefetchSentences,
+    );
   }
 
   Future<void> _playFromParagraph(int paragraphIndex) async {
@@ -193,6 +199,7 @@ class ReaderScreenState extends State<ReaderScreen> {
       url: url,
       voice: _voice,
       speed: _speed,
+      prefetch: _ttsPrefetchSentences,
       startParagraph: idx,
     );
   }
@@ -285,7 +292,7 @@ class ReaderScreenState extends State<ReaderScreen> {
       end - start + 1,
       (i) {
         final n = start + i;
-        return DropdownMenuEntry(value: n, label: 'Chapter $n');
+        return DropdownMenuEntry(value: n, label: '$n');
       },
       growable: false,
     );
@@ -368,7 +375,7 @@ class ReaderScreenState extends State<ReaderScreen> {
                     Row(
                       children: [
                         SizedBox(
-                          width: 130,
+                          width: 150,
                           child: DropdownMenu<int>(
                             label: const Text('Range'),
                             requestFocusOnTap: true,
@@ -392,7 +399,7 @@ class ReaderScreenState extends State<ReaderScreen> {
                         const SizedBox(width: 12),
                         Expanded(
                           child: DropdownMenu<int>(
-                            label: const Text('Chapter #'),
+                            label: const Text('Chapter'),
                             requestFocusOnTap: true,
                             enableFilter: true,
                             menuHeight: 360,
@@ -498,45 +505,9 @@ class ReaderScreenState extends State<ReaderScreen> {
             bottom: 16,
             child: GlassContainer(
               borderRadius: 36,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
               child: Row(
                 children: [
-                  Expanded(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (_busy || (_stream.connected && !_stream.paused))
-                          LinearProgressIndicator(
-                            value: null,
-                            minHeight: 4,
-                            borderRadius: BorderRadius.circular(999),
-                          )
-                        else
-                          SizedBox(
-                            height: 4,
-                            child: DecoratedBox(
-                              decoration: BoxDecoration(
-                                color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                            ),
-                          ),
-                        const SizedBox(height: 10),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Text('${_speed.toStringAsFixed(2)}x', style: Theme.of(context).textTheme.bodySmall),
-                            const SizedBox(width: 12),
-                            Text(
-                              _stream.paused ? 'Paused' : (_stream.connected ? 'Live' : 'Idle'),
-                              style: Theme.of(context).textTheme.bodySmall,
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 8),
                   IconButton(
                     onPressed: _stream.connected ? _pauseOrResume : (_busy ? null : _playCurrent),
                     iconSize: 30,

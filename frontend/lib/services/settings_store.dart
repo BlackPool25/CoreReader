@@ -31,12 +31,15 @@ class SettingsStore {
       _ => uri.scheme,
     };
 
+    // IMPORTANT (Flutter Web): a non-null empty fragment serializes as a trailing '#',
+    // and WebSocket URLs must not contain fragments.
     final normalized = uri.replace(
       scheme: scheme,
       path: '',
-      query: '',
-      fragment: '',
+      query: null,
+      fragment: null,
     );
+    // Strip trailing slash if present.
     return normalized.toString().replaceAll(RegExp(r'/$'), '');
   }
 
