@@ -2,17 +2,30 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
 import '../services/reader_controller_factory.dart';
 import '../services/reader_stream_controller.dart';
+import '../services/local_store.dart';
 import '../services/settings_store.dart';
 import '../widgets/glass_container.dart';
+import '../widgets/app_settings_scope.dart';
+import '../widgets/library_scope.dart';
 import 'highlight_in_paragraph.dart';
 
 class ReaderScreen extends StatefulWidget {
-  const ReaderScreen({super.key});
+  const ReaderScreen({
+    super.key,
+    required this.novel,
+    required this.chapter,
+    this.startParagraph = 0,
+  });
+
+  final StoredNovel novel;
+  final StoredChapter chapter;
+  final int startParagraph;
 
   @override
   State<ReaderScreen> createState() => ReaderScreenState();
@@ -20,20 +33,13 @@ class ReaderScreen extends StatefulWidget {
 
 class ReaderScreenState extends State<ReaderScreen> {
   static const int _ttsPrefetchSentences = 8;
-  final _novelController = TextEditingController(
-    text: 'https://www.novelcool.com/novel/Shadow-Slave.html',
-  );
-  final _urlController = TextEditingController(
-    text: 'https://www.novelcool.com/chapter/Shadow-Slave-Chapter-15/7332162/',
-  );
 
   late ReaderStreamController _stream;
   StreamSubscription? _sub;
 
   List<String> _voices = const ['af_bella'];
-  String _voice = 'af_bella';
-
-  double _speed = 1.0;
+  String? _sessionVoice;
+  double? _sessionSpeed;
 
   String? _title;
   String? _chapterUrl;
@@ -48,13 +54,9 @@ class ReaderScreenState extends State<ReaderScreen> {
   final _scrollController = ScrollController();
   List<GlobalKey> _paraKeys = const [];
 
-  int? _chapterCount;
-  int? _selectedChapterNum;
-
-  static const int _chapterRangeSize = 50;
-  int _chapterRangeStart = 1; // 1-indexed
-
   bool _busy = false;
+
+  late StoredChapter _chapter;
 
   void _showError(Object e) {
     final raw = e.toString();
@@ -73,21 +75,20 @@ class ReaderScreenState extends State<ReaderScreen> {
   @override
   void initState() {
     super.initState();
+    _chapter = widget.chapter;
     _stream = createReaderController();
     _sub = _stream.events.listen(_onEvent);
     unawaited(_loadVoices());
-    unawaited(_loadFontSize());
-  }
 
-  Future<void> refreshFromSettings() async {
-    await _loadVoices();
-    await _loadFontSize();
-  }
+    final settings = AppSettingsScope.of(context);
+    _fontSize = settings.fontSize;
+    _sessionVoice = settings.defaultVoice;
+    _sessionSpeed = settings.defaultSpeed;
 
-  Future<void> _loadFontSize() async {
-    final v = await SettingsStore.getReaderFontSize();
-    if (!mounted) return;
-    setState(() => _fontSize = v);
+    if (!kIsWeb) {
+      // Auto-start on mobile/desktop. Web often requires a user gesture.
+      unawaited(_playChapter(_chapter, startParagraph: widget.startParagraph));
+    }
   }
 
   void _onEvent(Map<String, dynamic> e) {
@@ -97,7 +98,10 @@ class ReaderScreenState extends State<ReaderScreen> {
       if (list.isNotEmpty) {
         setState(() {
           _voices = list;
-          if (!_voices.contains(_voice)) _voice = _voices.first;
+          final desired = _sessionVoice;
+          if (desired == null || !_voices.contains(desired)) {
+            _sessionVoice = _voices.first;
+          }
         });
       }
       return;
@@ -121,16 +125,29 @@ class ReaderScreenState extends State<ReaderScreen> {
     if (type == 'sentence') {
       final s = (e['text'] as String?) ?? '';
 
-      // Find paragraph index before setState so we can update together.
-      int idx = -1;
-      if (s.isNotEmpty) {
-        idx = _paragraphs.indexWhere((p) => p.contains(s));
-      }
+      final pIdx = (e['paragraph_index'] as num?)?.toInt();
 
       setState(() {
         _sentence = s;
-        if (idx >= 0) _currentParagraphIndex = idx;
+        if (pIdx != null) _currentParagraphIndex = pIdx;
       });
+
+      // Persist progress (paragraph-level resume is sufficient).
+      final library = LibraryScope.of(context);
+      unawaited(
+        library.setProgress(
+          (library.progressFor(widget.novel.id) ?? StoredReadingProgress(
+            novelId: widget.novel.id,
+            chapterN: _chapter.n,
+            paragraphIndex: max(0, _currentParagraphIndex),
+            updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+            completedChapters: <int>{},
+          )).copyWith(
+            chapterN: _chapter.n,
+            paragraphIndex: max(0, _currentParagraphIndex),
+          ),
+        ),
+      );
       return;
     }
 
@@ -140,6 +157,29 @@ class ReaderScreenState extends State<ReaderScreen> {
         _prevUrl = e['prev_url'] as String?;
         _busy = false;
       });
+
+      final library = LibraryScope.of(context);
+      unawaited(library.markRead(widget.novel.id, _chapter.n, read: true));
+
+      // Auto-advance progress to next chapter (if present) for "Continue".
+      final cache = library.cacheFor(widget.novel.id);
+      final next = cache?.chapters.firstWhere(
+        (c) => c.n == _chapter.n + 1,
+        orElse: () => StoredChapter(n: 0, title: '', url: ''),
+      );
+      if (next != null && next.n > 0) {
+        unawaited(
+          library.setProgress(
+            StoredReadingProgress(
+              novelId: widget.novel.id,
+              chapterN: next.n,
+              paragraphIndex: 0,
+              updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+              completedChapters: (library.progressFor(widget.novel.id)?.completedChapters ?? <int>{}).toSet(),
+            ),
+          ),
+        );
+      }
       return;
     }
 
@@ -152,7 +192,7 @@ class ReaderScreenState extends State<ReaderScreen> {
 
   Future<void> _loadVoices() async {
     try {
-      final base = await SettingsStore.getServerBaseUrl();
+      final base = AppSettingsScope.of(context).serverBaseUrl;
       final uri = SettingsStore.httpUri(base, '/voices');
       final res = await http.get(uri).timeout(const Duration(seconds: 10));
       if (res.statusCode != 200) {
@@ -164,7 +204,9 @@ class ReaderScreenState extends State<ReaderScreen> {
         if (voices.isNotEmpty) {
           setState(() {
             _voices = voices;
-            if (!_voices.contains(_voice)) _voice = _voices.first;
+            if (_sessionVoice == null || !_voices.contains(_sessionVoice)) {
+              _sessionVoice = _voices.first;
+            }
           });
         }
       }
@@ -173,135 +215,28 @@ class ReaderScreenState extends State<ReaderScreen> {
     }
   }
 
-  Future<void> _playUrl(String url) async {
-    setState(() => _busy = true);
-    await _stream.primeAudio();
-    await _stream.connectAndPlay(
-      url: url,
-      voice: _voice,
-      speed: _speed,
-      prefetch: _ttsPrefetchSentences,
-    );
-  }
+  String get _effectiveVoice => _sessionVoice ?? (_voices.isNotEmpty ? _voices.first : 'af_bella');
+  double get _effectiveSpeed => (_sessionSpeed ?? AppSettingsScope.of(context).defaultSpeed);
 
-  Future<void> _playFromParagraph(int paragraphIndex) async {
-    final url = _urlController.text.trim();
-    if (url.isEmpty) return;
-    final idx = paragraphIndex
-        .clamp(0, max(0, _paragraphs.length - 1))
-        .toInt();
+  Future<void> _playChapter(StoredChapter chapter, {int startParagraph = 0}) async {
     setState(() {
       _busy = true;
-      _currentParagraphIndex = idx;
+      _chapter = chapter;
+      _currentParagraphIndex = max(0, startParagraph);
     });
     await _stream.primeAudio();
     await _stream.connectAndPlay(
-      url: url,
-      voice: _voice,
-      speed: _speed,
+      url: chapter.url,
+      voice: _effectiveVoice,
+      speed: _effectiveSpeed,
       prefetch: _ttsPrefetchSentences,
-      startParagraph: idx,
+      startParagraph: max(0, startParagraph),
     );
   }
 
-  Future<void> _loadChapters() async {
-    setState(() => _busy = true);
-    try {
-      final novelUrl = _novelController.text.trim();
-
-      final base = await SettingsStore.getServerBaseUrl();
-      final metaUri = SettingsStore.httpUri(base, '/novel_meta').replace(
-        queryParameters: {'url': novelUrl},
-      );
-      final metaRes = await http.get(metaUri).timeout(const Duration(seconds: 25));
-      if (metaRes.statusCode != 200) throw Exception('Failed to load chapter count');
-      final decoded = jsonDecode(metaRes.body);
-      final count = (decoded is Map ? decoded['count'] : null);
-      final chapterCount = (count as num?)?.toInt() ?? 0;
-      if (chapterCount <= 0) throw Exception('No chapters found');
-
-      setState(() {
-        _chapterCount = chapterCount;
-        _selectedChapterNum = 1;
-        _chapterRangeStart = 1;
-        _busy = false;
-      });
-
-      // Resolve chapter #1 to a concrete URL.
-      await _selectChapterNum(1);
-    } catch (e) {
-      setState(() => _busy = false);
-      _showError(e);
-    }
-  }
-
-  Future<void> _selectChapterNum(int n) async {
-    setState(() {
-      _busy = true;
-      _selectedChapterNum = n;
-    });
-    try {
-      final base = await SettingsStore.getServerBaseUrl();
-      final uri = SettingsStore.httpUri(base, '/novel_chapter').replace(
-        queryParameters: {
-          'url': _novelController.text.trim(),
-          'n': n.toString(),
-        },
-      );
-      final res = await http.get(uri).timeout(const Duration(seconds: 25));
-      if (res.statusCode != 200) throw Exception('Failed to resolve chapter URL');
-      final decoded = jsonDecode(res.body);
-      final url = (decoded is Map ? decoded['url'] : null)?.toString() ?? '';
-      if (url.isEmpty) throw Exception('Backend returned empty chapter URL');
-      setState(() {
-        _urlController.text = url;
-        _busy = false;
-      });
-    } catch (e) {
-      setState(() => _busy = false);
-      _showError(e);
-    }
-  }
-
-  int _rangeEnd(int start) {
-    final count = _chapterCount ?? start;
-    return min(start + _chapterRangeSize - 1, count);
-  }
-
-  List<DropdownMenuEntry<int>> _rangeEntries() {
-    final count = _chapterCount;
-    if (count == null || count <= 0) return const [];
-    final ranges = ((count - 1) ~/ _chapterRangeSize) + 1;
-    return List.generate(
-      ranges,
-      (i) {
-        final start = i * _chapterRangeSize + 1;
-        final end = _rangeEnd(start);
-        return DropdownMenuEntry(value: start, label: '$start-$end');
-      },
-      growable: false,
-    );
-  }
-
-  List<DropdownMenuEntry<int>> _chapterEntriesForCurrentRange() {
-    final count = _chapterCount;
-    if (count == null || count <= 0) return const [];
-    final start = _chapterRangeStart;
-    final end = _rangeEnd(start);
-    return List.generate(
-      end - start + 1,
-      (i) {
-        final n = start + i;
-        return DropdownMenuEntry(value: n, label: '$n');
-      },
-      growable: false,
-    );
-  }
-
-  Future<void> _playCurrent() async {
-    final url = _urlController.text.trim();
-    if (url.isEmpty) return;
-    await _playUrl(url);
+  Future<void> _restartFromCurrentParagraph() async {
+    final idx = _currentParagraphIndex < 0 ? 0 : _currentParagraphIndex;
+    await _playChapter(_chapter, startParagraph: idx);
   }
 
   Future<void> _pauseOrResume() async {
@@ -319,26 +254,57 @@ class ReaderScreenState extends State<ReaderScreen> {
     _sub?.cancel();
     _stream.dispose();
     _scrollController.dispose();
-    _novelController.dispose();
-    _urlController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final canNext = _nextUrl != null && _nextUrl!.isNotEmpty;
-    final canPrev = _prevUrl != null && _prevUrl!.isNotEmpty;
+    final library = LibraryScope.of(context);
+    final cache = library.cacheFor(widget.novel.id);
+    final chapters = cache?.chapters ?? const <StoredChapter>[];
+    final curIdx = chapters.indexWhere((c) => c.n == _chapter.n);
+    final prevChapter = (curIdx > 0) ? chapters[curIdx - 1] : null;
+    final nextChapter = (curIdx >= 0 && curIdx < chapters.length - 1) ? chapters[curIdx + 1] : null;
+
+    final canNext = nextChapter != null || (_nextUrl != null && _nextUrl!.isNotEmpty);
+    final canPrev = prevChapter != null || (_prevUrl != null && _prevUrl!.isNotEmpty);
     final canPrevPara = _paragraphs.isNotEmpty && _currentParagraphIndex > 0;
     final canNextPara = _paragraphs.isNotEmpty && _currentParagraphIndex >= 0 && _currentParagraphIndex < _paragraphs.length - 1;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(_title ?? 'CoreReader'),
+        title: Text(_title ?? 'Chapter ${_chapter.n}'),
         actions: [
           IconButton(
             tooltip: 'Reload voices',
             onPressed: _loadVoices,
             icon: const Icon(Icons.record_voice_over),
+          ),
+          IconButton(
+            tooltip: 'Session voice/speed',
+            onPressed: () async {
+              final result = await showModalBottomSheet<_SessionSettings>(
+                context: context,
+                showDragHandle: true,
+                builder: (context) {
+                  return _SessionSettingsSheet(
+                    voices: _voices,
+                    voice: _effectiveVoice,
+                    speed: _effectiveSpeed,
+                    fontSize: _fontSize,
+                  );
+                },
+              );
+              if (result == null) return;
+              setState(() {
+                _sessionVoice = result.voice;
+                _sessionSpeed = result.speed;
+              });
+              if (_stream.connected) {
+                await _restartFromCurrentParagraph();
+              }
+            },
+            icon: const Icon(Icons.tune),
           ),
         ],
       ),
@@ -352,113 +318,12 @@ class ReaderScreenState extends State<ReaderScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('Novel', style: TextStyle(fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: _novelController,
-                      keyboardType: TextInputType.url,
-                      decoration: const InputDecoration(
-                        border: OutlineInputBorder(),
-                        hintText: 'https://www.novelcool.com/novel/...',
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: FilledButton.icon(
-                        onPressed: _busy ? null : _loadChapters,
-                        icon: const Icon(Icons.list),
-                        label: const Text('Load chapters'),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        SizedBox(
-                          width: 150,
-                          child: DropdownMenu<int>(
-                            label: const Text('Range'),
-                            requestFocusOnTap: true,
-                            enableFilter: false,
-                            menuHeight: 320,
-                            initialSelection: _chapterRangeStart,
-                            dropdownMenuEntries: _rangeEntries(),
-                            onSelected: (start) {
-                              if (start == null) return;
-                              setState(() => _chapterRangeStart = start);
-
-                              // Keep selection within range.
-                              final selected = _selectedChapterNum;
-                              final end = _rangeEnd(start);
-                              if (selected == null || selected < start || selected > end) {
-                                unawaited(_selectChapterNum(start));
-                              }
-                            },
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: DropdownMenu<int>(
-                            label: const Text('Chapter'),
-                            requestFocusOnTap: true,
-                            enableFilter: true,
-                            menuHeight: 360,
-                            initialSelection: _selectedChapterNum,
-                            dropdownMenuEntries: _chapterEntriesForCurrentRange(),
-                            onSelected: (c) {
-                              if (c == null) return;
-                              unawaited(_selectChapterNum(c));
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: DropdownButtonFormField<String>(
-                            initialValue: _voice,
-                            items: _voices
-                                .map((v) => DropdownMenuItem(value: v, child: Text(v)))
-                                .toList(growable: false),
-                            onChanged: (v) => setState(() => _voice = v ?? _voice),
-                            decoration: const InputDecoration(
-                              labelText: 'Voice',
-                              border: OutlineInputBorder(),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        FilledButton.icon(
-                          onPressed: _busy ? null : _playCurrent,
-                          icon: const Icon(Icons.play_arrow),
-                          label: const Text('Play'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    Text('Speed: ${_speed.toStringAsFixed(2)}x'),
-                    Slider(
-                      value: _speed,
-                      min: 0.5,
-                      max: 2.0,
-                      divisions: 30,
-                      label: '${_speed.toStringAsFixed(2)}x',
-                      onChanged: (v) => setState(() => _speed = v),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 18),
-              GlassContainer(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
                     Text(
-                      _title ?? 'No chapter loaded',
+                      widget.novel.name,
                       style: Theme.of(context).textTheme.titleMedium,
                     ),
+                    const SizedBox(height: 6),
+                    Text('Chapter ${_chapter.n}', style: Theme.of(context).textTheme.bodySmall),
                     if (_chapterUrl != null) ...[
                       const SizedBox(height: 6),
                       Text(
@@ -488,7 +353,7 @@ class ReaderScreenState extends State<ReaderScreen> {
                         padding: const EdgeInsets.only(bottom: 14),
                         child: GestureDetector(
                           behavior: HitTestBehavior.opaque,
-                          onTap: () => unawaited(_playFromParagraph(i)),
+                          onTap: () => unawaited(_playChapter(_chapter, startParagraph: i)),
                           child: HighlightInParagraph(paragraph: p, highlight: _sentence, fontSize: _fontSize),
                         ),
                       );
@@ -509,7 +374,9 @@ class ReaderScreenState extends State<ReaderScreen> {
               child: Row(
                 children: [
                   IconButton(
-                    onPressed: _stream.connected ? _pauseOrResume : (_busy ? null : _playCurrent),
+                    onPressed: _stream.connected
+                        ? _pauseOrResume
+                        : (_busy ? null : () => unawaited(_playChapter(_chapter, startParagraph: widget.startParagraph))),
                     iconSize: 30,
                     icon: Icon(
                       _stream.connected && !_stream.paused ? Icons.pause : Icons.play_arrow,
@@ -517,22 +384,61 @@ class ReaderScreenState extends State<ReaderScreen> {
                   ),
                   IconButton(
                     tooltip: 'Prev paragraph',
-                    onPressed: canPrevPara ? () => unawaited(_playFromParagraph(_currentParagraphIndex - 1)) : null,
+                    onPressed: canPrevPara ? () => unawaited(_playChapter(_chapter, startParagraph: _currentParagraphIndex - 1)) : null,
                     icon: const Icon(Icons.keyboard_double_arrow_up),
                   ),
                   IconButton(
                     tooltip: 'Next paragraph',
-                    onPressed: canNextPara ? () => unawaited(_playFromParagraph(_currentParagraphIndex + 1)) : null,
+                    onPressed: canNextPara ? () => unawaited(_playChapter(_chapter, startParagraph: _currentParagraphIndex + 1)) : null,
                     icon: const Icon(Icons.keyboard_double_arrow_down),
                   ),
                   IconButton(
                     tooltip: 'Prev',
-                    onPressed: canPrev ? () => _playUrl(_prevUrl!) : null,
+                    onPressed: canPrev
+                        ? () {
+                            if (prevChapter != null) {
+                              unawaited(_playChapter(prevChapter));
+                              return;
+                            }
+                            final u = _prevUrl;
+                            if (u != null && u.isNotEmpty) {
+                              // Fallback: unknown chapter number; try mapping by url.
+                              final mapped = chapters.firstWhere(
+                                (c) => c.url == u,
+                                orElse: () => StoredChapter(n: 0, title: '', url: ''),
+                              );
+                              if (mapped.n > 0) {
+                                unawaited(_playChapter(mapped));
+                              } else {
+                                unawaited(_playChapter(StoredChapter(n: _chapter.n, title: '', url: u)));
+                              }
+                            }
+                          }
+                        : null,
                     icon: const Icon(Icons.skip_previous),
                   ),
                   IconButton(
                     tooltip: 'Next',
-                    onPressed: canNext ? () => _playUrl(_nextUrl!) : null,
+                    onPressed: canNext
+                        ? () {
+                            if (nextChapter != null) {
+                              unawaited(_playChapter(nextChapter));
+                              return;
+                            }
+                            final u = _nextUrl;
+                            if (u != null && u.isNotEmpty) {
+                              final mapped = chapters.firstWhere(
+                                (c) => c.url == u,
+                                orElse: () => StoredChapter(n: 0, title: '', url: ''),
+                              );
+                              if (mapped.n > 0) {
+                                unawaited(_playChapter(mapped));
+                              } else {
+                                unawaited(_playChapter(StoredChapter(n: _chapter.n, title: '', url: u)));
+                              }
+                            }
+                          }
+                        : null,
                     icon: const Icon(Icons.skip_next),
                   ),
                 ],
@@ -551,6 +457,104 @@ class ReaderScreenState extends State<ReaderScreen> {
             ),
         ],
       ),
+    );
+  }
+}
+
+class _SessionSettings {
+  _SessionSettings({required this.voice, required this.speed});
+
+  final String voice;
+  final double speed;
+}
+
+class _SessionSettingsSheet extends StatefulWidget {
+  const _SessionSettingsSheet({
+    required this.voices,
+    required this.voice,
+    required this.speed,
+    required this.fontSize,
+  });
+
+  final List<String> voices;
+  final String voice;
+  final double speed;
+  final double fontSize;
+
+  @override
+  State<_SessionSettingsSheet> createState() => _SessionSettingsSheetState();
+}
+
+class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
+  late String _voice;
+  late double _speed;
+
+  @override
+  void initState() {
+    super.initState();
+    _voice = widget.voice;
+    _speed = widget.speed;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      minimum: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Session settings', style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(
+            initialValue: _voice,
+            items: widget.voices
+                .map((v) => DropdownMenuItem(value: v, child: Text(v)))
+                .toList(growable: false),
+            onChanged: (v) => setState(() => _voice = v ?? _voice),
+            decoration: const InputDecoration(
+              labelText: 'Voice (this session)',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text('Speed: ${_speed.toStringAsFixed(2)}x'),
+          Slider(
+            value: _speed,
+            min: 0.7,
+            max: 1.4,
+            divisions: 28,
+            label: '${_speed.toStringAsFixed(2)}x',
+            onChanged: (v) => setState(() => _speed = v),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              const Spacer(),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(_SessionSettings(voice: _voice, speed: _speed)),
+                child: const Text('Apply'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+extension on StoredReadingProgress {
+  StoredReadingProgress copyWith({
+    int? chapterN,
+    int? paragraphIndex,
+    Set<int>? completedChapters,
+  }) {
+    return StoredReadingProgress(
+      novelId: novelId,
+      chapterN: chapterN ?? this.chapterN,
+      paragraphIndex: paragraphIndex ?? this.paragraphIndex,
+      updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+      completedChapters: completedChapters ?? this.completedChapters,
     );
   }
 }

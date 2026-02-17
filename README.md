@@ -2,7 +2,9 @@
 
 This repo contains:
 - `backend/`: FastAPI WebSocket server (scrape chapter text + stream PCM audio from local TTS)
-- `frontend/`: Flutter app (URL input, voice selector, sentence preview, play/pause, next/prev, settings)
+- `frontend/`: Flutter app (Library + chapter list + reader route, settings, local caching/history)
+
+Developer notes for contributors/agents: see `.agents.md`.
 
 ## Backend (Python + FastAPI)
 
@@ -103,15 +105,17 @@ flutter run
 
 ## Runtime flow
 
-1. Paste a NovelCool chapter URL in the Reader screen.
-2. Pick a voice and speed.
-3. Press **Play**.
+1. Add a novel (name + NovelCool URL) in **Add novel**.
+2. Open it from **Library** → refresh chapters (cached locally).
+3. Pick a chapter to start reading.
+4. Adjust **default** voice/speed in **Settings** (persisted locally).
+5. In the Reader, you can adjust **session** voice/speed; changes apply instantly by restarting from the current paragraph.
 4. The backend:
   - scrapes the chapter text from the chapter content container (`div.site-content div.overflow-hidden`)
-   - splits into sentences
-   - pre-synthesizes a few sentences ahead (prefetch) to reduce boundary pauses
+  - splits into sentences (paragraph-aware) and adds short pauses for more natural pacing
+  - pre-synthesizes a few sentences ahead (prefetch) to reduce boundary pauses
    - streams PCM16 audio frames over WebSocket
-5. The app plays audio immediately and shows the currently spoken sentence.
+5. The app plays audio immediately and highlights the currently spoken sentence (synced via sentence metadata from backend).
 
 > Note: This project is intended for personal/local use.
 
@@ -144,10 +148,22 @@ flutter run -d chrome --web-port 3000 \
   --web-header="Cross-Origin-Embedder-Policy=require-corp"
 ```
 
+This repo also includes the required `flutter_soloud` Web bootstrap scripts in `frontend/web/index.html`:
+- `assets/packages/flutter_soloud/web/libflutter_soloud_plugin.js`
+- `assets/packages/flutter_soloud/web/init_module.dart.js`
+
 ## Data flow (high level)
 
 - Frontend (Flutter) calls backend `GET /voices` to populate the voice list.
-- Frontend opens `WS /ws` and sends `{ "command": "play", "url": <chapter_url>, "voice": <id>, "speed": <x> }`.
+- Frontend opens `WS /ws` and sends `{ "command": "play", "url": <chapter_url>, "voice": <id>, "speed": <x>, "start_paragraph": <idx> }`.
 - Backend scrapes the chapter, emits a `chapter_info` JSON message (paragraphs + audio format), then streams PCM16 audio frames.
-- Backend emits `sentence` JSON messages for highlighting.
+- Backend emits `sentence` JSON messages for highlighting, including `paragraph_index` and `sentence_index`.
 - Frontend can send `{ "command": "pause" }`, `{ "command": "resume" }`, `{ "command": "stop" }` during playback.
+
+## Local persistence (frontend)
+
+The app stores the following locally (SharedPreferences):
+- Backend server URL, theme mode, reader font size, default voice, default speed
+- Library novels (name + url)
+- Cached chapter lists per novel (use **Refresh Chapters** to update)
+- Reading progress and read/unread history (auto-mark read on chapter completion)

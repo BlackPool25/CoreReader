@@ -100,6 +100,20 @@ class TTSEngine:
         sentences = re.split(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s+", text)
         return [s.strip() for s in sentences if s and s.strip()]
 
+    def split_paragraphs(self, paragraphs: List[str]) -> List[tuple[int, int, str, bool]]:
+        """Flatten paragraphs into (paragraph_index, sentence_index, sentence_text, is_last_in_paragraph)."""
+        out: List[tuple[int, int, str, bool]] = []
+        for p_idx, p in enumerate(paragraphs):
+            p = (p or "").strip()
+            if not p:
+                continue
+            sentences = self.split_sentences(p)
+            if not sentences:
+                sentences = [p]
+            for s_idx, s in enumerate(sentences):
+                out.append((p_idx, s_idx, s, s_idx == (len(sentences) - 1)))
+        return out
+
     def _iter_pcm_frames(self, pcm16: bytes, frame_bytes: int) -> Iterable[bytes]:
         if frame_bytes <= 0:
             yield pcm16
@@ -156,6 +170,85 @@ class TTSEngine:
                     if cancel_event is not None and cancel_event.is_set():
                         return
                     yield (sentence, frame)
+        finally:
+            producer_task.cancel()
+            with contextlib.suppress(Exception):
+                await producer_task
+
+    async def generate_audio_stream_paragraphs(
+        self,
+        paragraphs: List[str],
+        voice: str = "af_bella",
+        speed: float = 1.0,
+        prefetch_sentences: int = 3,
+        frame_ms: int = 200,
+        cancel_event: Optional[asyncio.Event] = None,
+        *,
+        pause_sentence_ms: int = 120,
+        pause_period_ms: int = 180,
+        pause_exclaim_ms: int = 200,
+        pause_question_ms: int = 260,
+        pause_paragraph_extra_ms: int = 240,
+    ) -> AsyncIterator[tuple[int, int, str, bytes]]:
+        """Yield (paragraph_index, sentence_index, sentence_text, pcm16_frame_bytes).
+
+        Adds a small silence pause after each sentence, and a larger one at paragraph boundaries.
+        """
+        segments = self.split_paragraphs(paragraphs)
+        queue: asyncio.Queue[Optional[tuple[int, int, str, bytes, int]]] = asyncio.Queue(
+            maxsize=max(1, prefetch_sentences)
+        )
+
+        frame_samples = int(self.sample_rate * (frame_ms / 1000.0))
+        frame_bytes = frame_samples * 2  # int16 mono
+
+        def pause_ms_for(sentence: str, is_last_in_paragraph: bool) -> int:
+            s = sentence.rstrip()
+            base = pause_sentence_ms
+            if s.endswith('?'):
+                base = pause_question_ms
+            elif s.endswith('!'):
+                base = pause_exclaim_ms
+            elif s.endswith('.'):
+                base = pause_period_ms
+            if is_last_in_paragraph:
+                base += pause_paragraph_extra_ms
+            return max(0, int(base))
+
+        async def producer() -> None:
+            try:
+                for p_idx, s_idx, s, is_last in segments:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    if not s:
+                        continue
+                    pcm16 = await self.synthesize_sentence_pcm16(s, voice=voice, speed=speed)
+                    pause_ms = pause_ms_for(s, is_last)
+                    await queue.put((p_idx, s_idx, s, pcm16, pause_ms))
+            finally:
+                await queue.put(None)
+
+        producer_task = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                p_idx, s_idx, sentence, pcm16, pause_ms = item
+                for frame in self._iter_pcm_frames(pcm16, frame_bytes=frame_bytes):
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    yield (p_idx, s_idx, sentence, frame)
+
+                if pause_ms > 0:
+                    silence_samples = int(self.sample_rate * (pause_ms / 1000.0))
+                    silence_bytes = silence_samples * 2
+                    # Chunk silence into normal frames.
+                    silence = b"\x00" * silence_bytes
+                    for frame in self._iter_pcm_frames(silence, frame_bytes=frame_bytes):
+                        if cancel_event is not None and cancel_event.is_set():
+                            return
+                        yield (p_idx, s_idx, sentence, frame)
         finally:
             producer_task.cancel()
             with contextlib.suppress(Exception):

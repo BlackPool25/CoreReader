@@ -243,7 +243,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         start_paragraph = max(0, len(paragraphs) - 1)
 
                     paragraphs_slice = paragraphs[start_paragraph:] if start_paragraph else paragraphs
-                    text = "\n".join([p for p in paragraphs_slice if p])
                     await websocket.send_json(
                         {
                             "type": "chapter_info",
@@ -262,7 +261,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         }
                     )
 
-                    last_sentence = None
+                    last_key = None
                     try:
                         control_task: asyncio.Task[str] | None = asyncio.create_task(websocket.receive_text())
 
@@ -280,8 +279,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             elif cmd == "stop":
                                 cancel_event.set()
 
-                        async for sentence, audio_frame in app.state.tts.generate_audio_stream(
-                            text,
+                        async for p_idx, s_idx, sentence, audio_frame in app.state.tts.generate_audio_stream_paragraphs(
+                            paragraphs_slice,
                             voice=voice,
                             speed=speed,
                             prefetch_sentences=prefetch,
@@ -314,9 +313,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
                             if cancel_event.is_set():
                                 break
-                            if sentence != last_sentence:
-                                last_sentence = sentence
-                                await websocket.send_json({"type": "sentence", "text": sentence})
+                            key = (p_idx + start_paragraph, s_idx, sentence)
+                            if key != last_key:
+                                last_key = key
+                                await websocket.send_json(
+                                    {
+                                        "type": "sentence",
+                                        "text": sentence,
+                                        "paragraph_index": int(p_idx + start_paragraph),
+                                        "sentence_index": int(s_idx),
+                                    }
+                                )
                             await websocket.send_bytes(audio_frame)
 
                             # Pace frames close to real-time so UI updates (sentence highlighting)
