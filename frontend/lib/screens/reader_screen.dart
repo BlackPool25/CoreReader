@@ -12,6 +12,7 @@ import '../services/local_store.dart';
 import '../services/settings_store.dart';
 import '../widgets/glass_container.dart';
 import '../widgets/app_settings_scope.dart';
+import '../widgets/downloads_scope.dart';
 import '../widgets/library_scope.dart';
 import 'highlight_in_paragraph.dart';
 
@@ -49,12 +50,20 @@ class ReaderScreenState extends State<ReaderScreen> {
   List<String> _paragraphs = const [];
   int _currentParagraphIndex = -1;
 
+  bool _playingOffline = false;
+  int _sentenceToken = 0;
+
+  bool _showNowReading = false;
+  bool _autoScroll = true;
+
   double _fontSize = 16.0;
 
   final _scrollController = ScrollController();
   List<GlobalKey> _paraKeys = const [];
 
   bool _busy = false;
+
+  bool _didInit = false;
 
   late StoredChapter _chapter;
 
@@ -78,12 +87,22 @@ class ReaderScreenState extends State<ReaderScreen> {
     _chapter = widget.chapter;
     _stream = createReaderController();
     _sub = _stream.events.listen(_onEvent);
-    unawaited(_loadVoices());
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_didInit) return;
+    _didInit = true;
 
     final settings = AppSettingsScope.of(context);
     _fontSize = settings.fontSize;
     _sessionVoice = settings.defaultVoice;
     _sessionSpeed = settings.defaultSpeed;
+    _showNowReading = settings.showNowReading;
+    _autoScroll = settings.readerAutoScroll;
+
+    unawaited(_loadVoices());
 
     if (!kIsWeb) {
       // Auto-start on mobile/desktop. Web often requires a user gesture.
@@ -127,9 +146,30 @@ class ReaderScreenState extends State<ReaderScreen> {
 
       final pIdx = (e['paragraph_index'] as num?)?.toInt();
 
-      setState(() {
-        _sentence = s;
-        if (pIdx != null) _currentParagraphIndex = pIdx;
+      final token = ++_sentenceToken;
+      final delayMs = _playingOffline ? 0 : AppSettingsScope.of(context).highlightDelayMs;
+      Future<void>.delayed(Duration(milliseconds: delayMs), () {
+        if (!mounted) return;
+        if (token != _sentenceToken) return;
+        setState(() {
+          _sentence = s;
+          if (pIdx != null) _currentParagraphIndex = pIdx;
+        });
+        if (_autoScroll && _currentParagraphIndex >= 0 && _currentParagraphIndex < _paraKeys.length) {
+          final key = _paraKeys[_currentParagraphIndex];
+          final ctx = key.currentContext;
+          if (ctx != null) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!mounted) return;
+              Scrollable.ensureVisible(
+                ctx,
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeOut,
+                alignment: 0.25,
+              );
+            });
+          }
+        }
       });
 
       // Persist progress (paragraph-level resume is sufficient).
@@ -159,27 +199,18 @@ class ReaderScreenState extends State<ReaderScreen> {
       });
 
       final library = LibraryScope.of(context);
-      unawaited(library.markRead(widget.novel.id, _chapter.n, read: true));
-
-      // Auto-advance progress to next chapter (if present) for "Continue".
       final cache = library.cacheFor(widget.novel.id);
       final next = cache?.chapters.firstWhere(
         (c) => c.n == _chapter.n + 1,
         orElse: () => StoredChapter(n: 0, title: '', url: ''),
       );
-      if (next != null && next.n > 0) {
-        unawaited(
-          library.setProgress(
-            StoredReadingProgress(
-              novelId: widget.novel.id,
-              chapterN: next.n,
-              paragraphIndex: 0,
-              updatedAtMs: DateTime.now().millisecondsSinceEpoch,
-              completedChapters: (library.progressFor(widget.novel.id)?.completedChapters ?? <int>{}).toSet(),
-            ),
-          ),
-        );
-      }
+      unawaited(
+        library.completeChapterAndAdvance(
+          novelId: widget.novel.id,
+          completedChapterN: _chapter.n,
+          nextChapterN: (next != null && next.n > 0) ? next.n : null,
+        ),
+      );
       return;
     }
 
@@ -224,6 +255,34 @@ class ReaderScreenState extends State<ReaderScreen> {
       _chapter = chapter;
       _currentParagraphIndex = max(0, startParagraph);
     });
+
+    final settings = AppSettingsScope.of(context);
+    final downloads = DownloadsScope.of(context);
+    final treeUri = settings.downloadsTreeUri;
+    final downloaded = downloads.downloadedChapter(widget.novel.id, chapter.n);
+    if (downloaded != null && treeUri != null && treeUri.trim().isNotEmpty) {
+      // Offline playback.
+      _playingOffline = true;
+      final meta = await downloads.loadMeta(treeUri: treeUri, chapter: downloaded);
+      if (meta == null) {
+        _playingOffline = false;
+        throw Exception('Downloaded metadata missing');
+      }
+      await _stream.primeAudio(sampleRate: meta.sampleRate);
+      await _stream.playDownloaded(
+        treeUri: treeUri,
+        pcmPath: downloaded.pcmPath,
+        metaJson: meta.toJson(),
+        playbackSpeed: _effectiveSpeed,
+        startParagraph: max(0, startParagraph),
+      );
+      setState(() => _busy = false);
+      unawaited(_manageAutoDownloads());
+      return;
+    }
+
+    // Streaming playback.
+    _playingOffline = false;
     await _stream.primeAudio();
     await _stream.connectAndPlay(
       url: chapter.url,
@@ -232,6 +291,59 @@ class ReaderScreenState extends State<ReaderScreen> {
       prefetch: _ttsPrefetchSentences,
       startParagraph: max(0, startParagraph),
     );
+
+    unawaited(_manageAutoDownloads());
+  }
+
+  Future<void> _manageAutoDownloads() async {
+    if (!mounted) return;
+    final settings = AppSettingsScope.of(context);
+    final tree = settings.downloadsTreeUri;
+    if (tree == null || tree.trim().isEmpty) return;
+
+    final library = LibraryScope.of(context);
+    final cache = library.cacheFor(widget.novel.id);
+    final chapters = cache?.chapters ?? const <StoredChapter>[];
+    if (chapters.isEmpty) return;
+
+    final downloads = DownloadsScope.of(context);
+    final ahead = settings.downloadsPrefetchAhead;
+    final behind = settings.downloadsKeepBehind;
+    final voice = settings.defaultVoice ?? 'af_bella';
+    final speed = settings.defaultSpeed;
+
+    // Queue ahead.
+    for (var i = 1; i <= ahead; i++) {
+      final n = _chapter.n + i;
+      final next = chapters.firstWhere(
+        (c) => c.n == n,
+        orElse: () => StoredChapter(n: 0, title: '', url: ''),
+      );
+      if (next.n <= 0) continue;
+      if (downloads.isDownloaded(widget.novel.id, next.n)) continue;
+      unawaited(
+        () async {
+          try {
+            await downloads.enqueueDownloadChapter(
+              treeUri: tree,
+              novelId: widget.novel.id,
+              chapterN: next.n,
+              chapterUrl: next.url,
+              voice: voice,
+              speed: speed,
+            );
+          } catch (_) {}
+        }(),
+      );
+    }
+
+    // Auto-delete behind.
+    final minKeep = _chapter.n - behind;
+    if (minKeep <= 1) return;
+    final toDelete = downloads.chaptersForNovel(widget.novel.id).where((c) => c.chapterN < minKeep).toList(growable: false);
+    for (final c in toDelete) {
+      unawaited(downloads.deleteDownloadedChapter(treeUri: tree, novelId: widget.novel.id, chapterN: c.chapterN).catchError((_) {}));
+    }
   }
 
   Future<void> _restartFromCurrentParagraph() async {
@@ -292,6 +404,8 @@ class ReaderScreenState extends State<ReaderScreen> {
                     voice: _effectiveVoice,
                     speed: _effectiveSpeed,
                     fontSize: _fontSize,
+                    showNowReading: _showNowReading,
+                    autoScroll: _autoScroll,
                   );
                 },
               );
@@ -299,9 +413,15 @@ class ReaderScreenState extends State<ReaderScreen> {
               setState(() {
                 _sessionVoice = result.voice;
                 _sessionSpeed = result.speed;
+                _showNowReading = result.showNowReading;
+                _autoScroll = result.autoScroll;
               });
               if (_stream.connected) {
-                await _restartFromCurrentParagraph();
+                if (_playingOffline) {
+                  await _stream.setPlaybackSpeed(_effectiveSpeed);
+                } else {
+                  await _restartFromCurrentParagraph();
+                }
               }
             },
             icon: const Icon(Icons.tune),
@@ -331,12 +451,14 @@ class ReaderScreenState extends State<ReaderScreen> {
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ],
-                    const SizedBox(height: 14),
-                    Text(
-                      _sentence.isEmpty ? 'Press Play to start reading.' : _sentence,
-                      style: Theme.of(context).textTheme.titleLarge?.copyWith(fontSize: _fontSize + 4),
-                      textAlign: TextAlign.center,
-                    ),
+                    if (_showNowReading) ...[
+                      const SizedBox(height: 14),
+                      Text(
+                        _sentence.isEmpty ? 'Press Play to start reading.' : _sentence,
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(fontSize: _fontSize + 4),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -462,10 +584,17 @@ class ReaderScreenState extends State<ReaderScreen> {
 }
 
 class _SessionSettings {
-  _SessionSettings({required this.voice, required this.speed});
+  _SessionSettings({
+    required this.voice,
+    required this.speed,
+    required this.showNowReading,
+    required this.autoScroll,
+  });
 
   final String voice;
   final double speed;
+  final bool showNowReading;
+  final bool autoScroll;
 }
 
 class _SessionSettingsSheet extends StatefulWidget {
@@ -474,12 +603,16 @@ class _SessionSettingsSheet extends StatefulWidget {
     required this.voice,
     required this.speed,
     required this.fontSize,
+    required this.showNowReading,
+    required this.autoScroll,
   });
 
   final List<String> voices;
   final String voice;
   final double speed;
   final double fontSize;
+  final bool showNowReading;
+  final bool autoScroll;
 
   @override
   State<_SessionSettingsSheet> createState() => _SessionSettingsSheetState();
@@ -488,12 +621,16 @@ class _SessionSettingsSheet extends StatefulWidget {
 class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
   late String _voice;
   late double _speed;
+  late bool _showNowReading;
+  late bool _autoScroll;
 
   @override
   void initState() {
     super.initState();
     _voice = widget.voice;
     _speed = widget.speed;
+    _showNowReading = widget.showNowReading;
+    _autoScroll = widget.autoScroll;
   }
 
   @override
@@ -528,11 +665,31 @@ class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
             onChanged: (v) => setState(() => _speed = v),
           ),
           const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _autoScroll,
+            title: const Text('Auto-scroll'),
+            onChanged: (v) => setState(() => _autoScroll = v),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _showNowReading,
+            title: const Text('Show “Now reading” box'),
+            onChanged: (v) => setState(() => _showNowReading = v),
+          ),
+          const SizedBox(height: 8),
           Row(
             children: [
               const Spacer(),
               FilledButton(
-                onPressed: () => Navigator.of(context).pop(_SessionSettings(voice: _voice, speed: _speed)),
+                onPressed: () => Navigator.of(context).pop(
+                  _SessionSettings(
+                    voice: _voice,
+                    speed: _speed,
+                    showNowReading: _showNowReading,
+                    autoScroll: _autoScroll,
+                  ),
+                ),
                 child: const Text('Apply'),
               ),
             ],

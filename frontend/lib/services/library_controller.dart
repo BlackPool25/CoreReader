@@ -32,10 +32,14 @@ class LibraryController extends ChangeNotifier {
   }
 
   Future<StoredNovel> addNovel({required String name, required String novelUrl}) async {
+    final normalizedUrl = _normalizeNovelUrl(novelUrl);
+    if (_novels.any((n) => _normalizeNovelUrl(n.novelUrl) == normalizedUrl)) {
+      throw Exception('A novel with the same URL is already in your library');
+    }
     final novel = StoredNovel(
       id: _makeId(),
       name: name.trim(),
-      novelUrl: novelUrl.trim(),
+      novelUrl: normalizedUrl,
       addedAtMs: DateTime.now().millisecondsSinceEpoch,
     );
     _novels = [..._novels, novel];
@@ -47,11 +51,45 @@ class LibraryController extends ChangeNotifier {
   Future<void> removeNovel(String novelId) async {
     _novels = _novels.where((n) => n.id != novelId).toList(growable: false);
     await LocalStore.saveLibrary(_novels);
+    await LocalStore.deleteNovelCache(novelId);
+    await LocalStore.deleteProgress(novelId);
     _cacheByNovelId.remove(novelId);
     _progressByNovelId.remove(novelId);
     notifyListeners();
   }
 
+  Future<void> setNovelCoverUrl(String novelId, String? coverUrl) async {
+    final idx = _novels.indexWhere((n) => n.id == novelId);
+    if (idx < 0) return;
+    final current = _novels[idx];
+    final next = StoredNovel(
+      id: current.id,
+      name: current.name,
+      novelUrl: current.novelUrl,
+      coverUrl: (coverUrl != null && coverUrl.trim().isNotEmpty) ? coverUrl.trim() : null,
+      addedAtMs: current.addedAtMs,
+    );
+    final list = [..._novels];
+    list[idx] = next;
+    _novels = list;
+    await LocalStore.saveLibrary(_novels);
+    notifyListeners();
+  }
+
+
+String _normalizeNovelUrl(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) return '';
+  try {
+    final uri = Uri.parse(trimmed);
+    // Drop fragment/query (NovelCool pages shouldn't need them).
+    final normalized = uri.replace(query: null, fragment: null);
+    // Also remove trailing slash for stable comparisons.
+    return normalized.toString().replaceAll(RegExp(r'/$'), '');
+  } catch (_) {
+    return trimmed.replaceAll(RegExp(r'/$'), '');
+  }
+}
   Future<void> setCache(String novelId, StoredNovelCache cache) async {
     _cacheByNovelId[novelId] = cache;
     await LocalStore.saveNovelCache(novelId, cache);
@@ -111,5 +149,32 @@ class LibraryController extends ChangeNotifier {
       updatedAtMs: DateTime.now().millisecondsSinceEpoch,
       completedChapters: set,
     ));
+  }
+
+  Future<void> completeChapterAndAdvance({
+    required String novelId,
+    required int completedChapterN,
+    required int? nextChapterN,
+  }) async {
+    final current = _progressByNovelId[novelId] ?? StoredReadingProgress(
+      novelId: novelId,
+      chapterN: max(1, completedChapterN),
+      paragraphIndex: 0,
+      updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+      completedChapters: <int>{},
+    );
+
+    final completed = {...current.completedChapters}..add(completedChapterN);
+    final nextN = (nextChapterN != null && nextChapterN > 0) ? nextChapterN : current.chapterN;
+
+    await setProgress(
+      StoredReadingProgress(
+        novelId: novelId,
+        chapterN: nextN,
+        paragraphIndex: 0,
+        updatedAtMs: DateTime.now().millisecondsSinceEpoch,
+        completedChapters: completed,
+      ),
+    );
   }
 }

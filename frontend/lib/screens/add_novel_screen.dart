@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 
 import '../widgets/glass_container.dart';
 import '../widgets/library_scope.dart';
+import '../widgets/app_settings_scope.dart';
+import '../services/settings_store.dart';
 
 class AddNovelScreen extends StatefulWidget {
   const AddNovelScreen({super.key});
@@ -28,7 +32,28 @@ class _AddNovelScreenState extends State<AddNovelScreen> {
     if (name.isEmpty || url.isEmpty) return;
     setState(() => _busy = true);
     try {
-      await LibraryScope.of(context).addNovel(name: name, novelUrl: url);
+      final library = LibraryScope.of(context);
+      final base = AppSettingsScope.of(context).serverBaseUrl;
+      final novel = await library.addNovel(name: name, novelUrl: url);
+
+      // Best-effort: fetch cover URL via backend and store it.
+      try {
+        final uri = SettingsStore.httpUri(base, '/novel_details').replace(
+          queryParameters: {'url': novel.novelUrl},
+        );
+        final res = await http.get(uri).timeout(const Duration(seconds: 15));
+        if (res.statusCode == 200) {
+          final decoded = jsonDecode(res.body);
+          if (decoded is Map) {
+            final cover = decoded['cover_url']?.toString();
+            if (cover != null && cover.trim().isNotEmpty) {
+              await library.setNovelCoverUrl(novel.id, cover);
+            }
+          }
+        }
+      } catch (_) {
+        // Ignore cover failures.
+      }
       if (!mounted) return;
       _name.clear();
       _url.clear();
@@ -47,42 +72,49 @@ class _AddNovelScreenState extends State<AddNovelScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(16),
-      child: GlassContainer(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Add novel',
-              style: Theme.of(context).textTheme.titleLarge,
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Add novel'),
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: GlassContainer(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Add novel',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _name,
+                  textInputAction: TextInputAction.next,
+                  decoration: const InputDecoration(
+                    labelText: 'Novel name',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _url,
+                  keyboardType: TextInputType.url,
+                  decoration: const InputDecoration(
+                    labelText: 'Novel URL',
+                    hintText: 'https://www.novelcool.com/novel/...html',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: _busy ? null : _add,
+                  icon: const Icon(Icons.add),
+                  label: const Text('Add to library'),
+                ),
+              ],
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _name,
-              textInputAction: TextInputAction.next,
-              decoration: const InputDecoration(
-                labelText: 'Novel name',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _url,
-              keyboardType: TextInputType.url,
-              decoration: const InputDecoration(
-                labelText: 'Novel URL',
-                hintText: 'https://www.novelcool.com/novel/...html',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: _busy ? null : _add,
-              icon: const Icon(Icons.add),
-              label: const Text('Add to library'),
-            ),
-          ],
+          ),
         ),
       ),
     );

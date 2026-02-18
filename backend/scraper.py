@@ -139,6 +139,42 @@ class NovelCoolScraper:
         links.sort(key=chapter_key)
         return links
 
+    async def scrape_novel_details(self, novel_url: str):
+        """Scrape a NovelCool novel page and return lightweight metadata.
+
+        Currently returns:
+        - title: best-effort title
+        - cover_url: absolute URL to the cover image, when detectable
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.get(novel_url, headers=self.headers) as response:
+                if response.status != 200:
+                    raise Exception(f"Failed to fetch page: {response.status}")
+                html = await response.text()
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        title = None
+        t = soup.find('title')
+        if t:
+            raw = t.get_text(strip=True)
+            if raw:
+                title = raw.split(' - Novel Cool', 1)[0].strip() or raw
+
+        cover_url = None
+        img = soup.select_one('img.bookinfo-pic-img')
+        if not img:
+            img = soup.select_one('img[itemprop="image"]')
+        if img:
+            src = img.get('src')
+            if src:
+                cover_url = urljoin(novel_url, src)
+
+        return {
+            "title": title,
+            "cover_url": cover_url,
+        }
+
 if __name__ == "__main__":
     import asyncio
     scraper = NovelCoolScraper()

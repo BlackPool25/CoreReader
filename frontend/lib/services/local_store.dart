@@ -7,18 +7,21 @@ class StoredNovel {
     required this.id,
     required this.name,
     required this.novelUrl,
+    this.coverUrl,
     required this.addedAtMs,
   });
 
   final String id;
   final String name;
   final String novelUrl;
+  final String? coverUrl;
   final int addedAtMs;
 
   Map<String, dynamic> toJson() => {
         'id': id,
         'name': name,
         'novelUrl': novelUrl,
+      'coverUrl': coverUrl,
         'addedAtMs': addedAtMs,
       };
 
@@ -27,6 +30,7 @@ class StoredNovel {
       id: (json['id'] as String?) ?? '',
       name: (json['name'] as String?) ?? '',
       novelUrl: (json['novelUrl'] as String?) ?? '',
+      coverUrl: (json['coverUrl'] as String?),
       addedAtMs: (json['addedAtMs'] as num?)?.toInt() ?? 0,
     );
   }
@@ -137,6 +141,16 @@ class LocalStore {
   static const _libraryKey = 'library_v1';
   static const _cachePrefix = 'novel_cache_v1:'; // + novelId
   static const _progressPrefix = 'reading_progress_v1:'; // + novelId
+
+  static Future<void> deleteNovelCache(String novelId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('$_cachePrefix$novelId');
+  }
+
+  static Future<void> deleteProgress(String novelId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('$_progressPrefix$novelId');
+  }
 
   static Future<List<StoredNovel>> loadLibrary() async {
     final prefs = await SharedPreferences.getInstance();

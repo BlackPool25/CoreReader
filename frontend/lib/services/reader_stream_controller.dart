@@ -14,6 +14,19 @@ abstract class ReaderStreamController {
     int startParagraph = 0,
   });
 
+  /// Play a locally downloaded chapter (PCM16 mono) and emit the same event
+  /// types as the backend stream (`chapter_info`, `sentence`, `chapter_complete`).
+  Future<void> playDownloaded({
+    required String treeUri,
+    required List<String> pcmPath,
+    required Map<String, dynamic> metaJson,
+    required double playbackSpeed,
+    int startParagraph,
+  });
+
+  /// Adjust playback speed for the current audio handle (offline chapters use this).
+  Future<void> setPlaybackSpeed(double speed);
+
   Future<void> pause();
   Future<void> resume();
   Future<void> stop();

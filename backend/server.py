@@ -71,6 +71,14 @@ async def novel_index(url: str):
     return {"chapters": chapters}
 
 
+@app.get("/novel_details")
+async def novel_details(url: str):
+    if not url:
+        return {"title": None, "cover_url": None, "error": "url is required"}
+    details = await app.state.scraper.scrape_novel_details(url)
+    return details
+
+
 async def _get_cached_novel_index(novel_url: str):
     """Return cached chapter list for a novel URL, scraping once per TTL."""
     if not novel_url:
@@ -208,6 +216,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     prefetch = int(message.get("prefetch", 3))
                     frame_ms = int(message.get("frame_ms", 200))
                     start_paragraph = int(message.get("start_paragraph", 0) or 0)
+                    realtime = bool(message.get("realtime", True))
 
                     if not url:
                         await websocket.send_json({"type": "error", "message": "URL is required"})
@@ -328,10 +337,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
                             # Pace frames close to real-time so UI updates (sentence highlighting)
                             # match what is audible, even when synthesis runs faster than realtime.
-                            try:
-                                await asyncio.sleep(len(audio_frame) / (2 * app.state.tts.sample_rate))
-                            except Exception:
-                                pass
+                            if realtime:
+                                try:
+                                    await asyncio.sleep(len(audio_frame) / (2 * app.state.tts.sample_rate))
+                                except Exception:
+                                    pass
 
                         if control_task is not None:
                             control_task.cancel()

@@ -1,0 +1,146 @@
+class DownloadedChapter {
+  DownloadedChapter({
+    required this.novelId,
+    required this.chapterN,
+    required this.title,
+    required this.chapterUrl,
+    required this.createdAtMs,
+    required this.sampleRate,
+    required this.voice,
+    required this.ttsSpeed,
+    required this.pcmPath,
+    required this.metaPath,
+  });
+
+  final String novelId;
+  final int chapterN;
+  final String title;
+  final String chapterUrl;
+  final int createdAtMs;
+
+  final int sampleRate;
+  final String voice;
+  final double ttsSpeed;
+
+  /// Storage-relative path segments under the configured downloads root.
+  /// Example: ["LN-TTS", novelId, "chapters", "12", "audio.pcm"]
+  final List<String> pcmPath;
+
+  /// Example: ["LN-TTS", novelId, "chapters", "12", "meta.json"]
+  final List<String> metaPath;
+
+  Map<String, dynamic> toJson() => {
+        'novelId': novelId,
+        'chapterN': chapterN,
+        'title': title,
+        'chapterUrl': chapterUrl,
+        'createdAtMs': createdAtMs,
+        'sampleRate': sampleRate,
+        'voice': voice,
+        'ttsSpeed': ttsSpeed,
+        'pcmPath': pcmPath,
+        'metaPath': metaPath,
+      };
+
+  static DownloadedChapter fromJson(Map<String, dynamic> json) {
+    final pcm = (json['pcmPath'] as List?)?.map((e) => e.toString()).toList() ?? const <String>[];
+    final meta = (json['metaPath'] as List?)?.map((e) => e.toString()).toList() ?? const <String>[];
+    return DownloadedChapter(
+      novelId: (json['novelId'] as String?) ?? '',
+      chapterN: (json['chapterN'] as num?)?.toInt() ?? 0,
+      title: (json['title'] as String?) ?? '',
+      chapterUrl: (json['chapterUrl'] as String?) ?? '',
+      createdAtMs: (json['createdAtMs'] as num?)?.toInt() ?? 0,
+      sampleRate: (json['sampleRate'] as num?)?.toInt() ?? 24000,
+      voice: (json['voice'] as String?) ?? '',
+      ttsSpeed: (json['ttsSpeed'] as num?)?.toDouble() ?? 1.0,
+      pcmPath: pcm,
+      metaPath: meta,
+    );
+  }
+}
+
+class ChapterTimelineItem {
+  ChapterTimelineItem({
+    required this.ms,
+    required this.text,
+    required this.paragraphIndex,
+    required this.sentenceIndex,
+  });
+
+  final int ms;
+  final String text;
+  final int paragraphIndex;
+  final int sentenceIndex;
+
+  Map<String, dynamic> toJson() => {
+        'ms': ms,
+        'text': text,
+        'p': paragraphIndex,
+        's': sentenceIndex,
+      };
+
+  static ChapterTimelineItem fromJson(Map<String, dynamic> json) {
+    return ChapterTimelineItem(
+      ms: (json['ms'] as num?)?.toInt() ?? 0,
+      text: (json['text'] as String?) ?? '',
+      paragraphIndex: (json['p'] as num?)?.toInt() ?? 0,
+      sentenceIndex: (json['s'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
+class DownloadedChapterMeta {
+  DownloadedChapterMeta({
+    required this.title,
+    required this.url,
+    required this.sampleRate,
+    required this.voice,
+    required this.ttsSpeed,
+    required this.paragraphs,
+    required this.timeline,
+  });
+
+  final String title;
+  final String url;
+  final int sampleRate;
+  final String voice;
+  final double ttsSpeed;
+  final List<String> paragraphs;
+  final List<ChapterTimelineItem> timeline;
+
+  Map<String, dynamic> toJson() => {
+        'v': 1,
+        'title': title,
+        'url': url,
+        'sampleRate': sampleRate,
+        'voice': voice,
+        'ttsSpeed': ttsSpeed,
+        'paragraphs': paragraphs,
+        'timeline': timeline.map((e) => e.toJson()).toList(growable: false),
+      };
+
+  static DownloadedChapterMeta fromJson(Map<String, dynamic> json) {
+    final paras = (json['paragraphs'] as List?)?.map((e) => e.toString()).toList() ?? const <String>[];
+    final rawTimeline = json['timeline'];
+    final timeline = <ChapterTimelineItem>[];
+    if (rawTimeline is List) {
+      for (final item in rawTimeline) {
+        if (item is Map<String, dynamic>) {
+          timeline.add(ChapterTimelineItem.fromJson(item));
+        } else if (item is Map) {
+          timeline.add(ChapterTimelineItem.fromJson(item.cast<String, dynamic>()));
+        }
+      }
+    }
+    return DownloadedChapterMeta(
+      title: (json['title'] as String?) ?? '',
+      url: (json['url'] as String?) ?? '',
+      sampleRate: (json['sampleRate'] as num?)?.toInt() ?? 24000,
+      voice: (json['voice'] as String?) ?? '',
+      ttsSpeed: (json['ttsSpeed'] as num?)?.toDouble() ?? 1.0,
+      paragraphs: paras,
+      timeline: timeline,
+    );
+  }
+}

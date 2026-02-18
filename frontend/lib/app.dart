@@ -22,9 +22,20 @@ class _CoreReaderAppState extends State<CoreReaderApp> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('CoreReader'),
-        actions: const [
-          ThemeToggleButton(),
-          SizedBox(width: 6),
+        actions: [
+          if (_index == 0) ...[
+            IconButton(
+              tooltip: 'Add novel',
+              onPressed: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const AddNovelScreen()),
+                );
+              },
+              icon: const Icon(Icons.add_circle_outline),
+            ),
+          ],
+          const ThemeToggleButton(),
+          const SizedBox(width: 6),
         ],
       ),
       body: AnimatedSwitcher(
@@ -36,7 +47,6 @@ class _CoreReaderAppState extends State<CoreReaderApp> {
           index: _index,
           children: const [
             LibraryScreen(),
-            AddNovelScreen(),
             SettingsScreen(),
           ],
         ),
@@ -52,7 +62,6 @@ class _CoreReaderAppState extends State<CoreReaderApp> {
               onDestinationSelected: (i) => setState(() => _index = i),
               destinations: const [
                 NavigationDestination(icon: Icon(Icons.local_library), label: 'Library'),
-                NavigationDestination(icon: Icon(Icons.add_circle_outline), label: 'Add novel'),
                 NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
               ],
             ),

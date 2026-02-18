@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter_soloud/flutter_soloud.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'android_saf.dart';
 import 'settings_store.dart';
 import 'ws_binary_to_bytes.dart';
 import 'reader_stream_controller.dart';
@@ -41,6 +43,16 @@ class NovelStreamController implements ReaderStreamController {
 
   Timer? _noAudioTimer;
   bool _receivedAnyAudio = false;
+
+  int? _pcmCarryByte;
+
+  // Offline playback state.
+  Timer? _offlineTimelineTimer;
+  int? _offlineReadHandle;
+  bool _offlineActive = false;
+  List<Map<String, dynamic>> _offlineTimeline = const [];
+  int _offlineTimelineIdx = 0;
+  int _offlineStartMs = 0;
 
   bool _connected = false;
   @override
@@ -184,7 +196,10 @@ class NovelStreamController implements ReaderStreamController {
         }
         if (_audioSource != null) {
           try {
-            _soloud.addAudioDataStream(_audioSource!, bytes);
+            final aligned = _alignPcm16(bytes);
+            if (aligned.isNotEmpty) {
+              _soloud.addAudioDataStream(_audioSource!, aligned);
+            }
           } catch (e) {
             _eventsController.add({'type': 'error', 'message': e.toString()});
           }
@@ -212,6 +227,176 @@ class NovelStreamController implements ReaderStreamController {
   }
 
   @override
+  Future<void> playDownloaded({
+    required String treeUri,
+    required List<String> pcmPath,
+    required Map<String, dynamic> metaJson,
+    required double playbackSpeed,
+    int startParagraph = 0,
+  }) async {
+    await stop();
+
+    final sampleRate = (metaJson['sampleRate'] as num?)?.toInt() ?? 24000;
+    final title = (metaJson['title'] as String?) ?? 'Downloaded chapter';
+    final url = (metaJson['url'] as String?) ?? '';
+    final paragraphs = (metaJson['paragraphs'] as List?)?.map((e) => e.toString()).toList() ?? const <String>[];
+    final rawTimeline = metaJson['timeline'];
+    final timeline = <Map<String, dynamic>>[];
+    if (rawTimeline is List) {
+      for (final item in rawTimeline) {
+        if (item is Map<String, dynamic>) {
+          timeline.add(item);
+        } else if (item is Map) {
+          timeline.add(item.cast<String, dynamic>());
+        }
+      }
+    }
+    timeline.sort((a, b) => ((a['ms'] as num?)?.toInt() ?? 0).compareTo(((b['ms'] as num?)?.toInt() ?? 0)));
+
+    // Compute a start offset based on requested paragraph.
+    _offlineStartMs = 0;
+    if (startParagraph > 0 && timeline.isNotEmpty) {
+      for (final item in timeline) {
+        final p = (item['p'] as num?)?.toInt() ?? 0;
+        if (p >= startParagraph) {
+          _offlineStartMs = (item['ms'] as num?)?.toInt() ?? 0;
+          break;
+        }
+      }
+    }
+
+    _offlineTimeline = timeline;
+    _offlineTimelineIdx = 0;
+    _offlineActive = true;
+
+    // Emit chapter_info (same shape as backend).
+    _eventsController.add({
+      'type': 'chapter_info',
+      'title': title,
+      'url': url,
+      'next_url': null,
+      'prev_url': null,
+      'paragraphs': paragraphs,
+      'start_paragraph': startParagraph,
+      'audio': {
+        'encoding': 'pcm_s16le',
+        'sample_rate': sampleRate,
+        'channels': 1,
+        'frame_ms': 200,
+      },
+    });
+
+    await _ensureAudioStream(sampleRate);
+    if (_handle != null) {
+      // Relative play speed affects audible rate (pitch shifts).
+      _soloud.setRelativePlaySpeed(_handle!, playbackSpeed);
+    }
+
+    // Start a timer to emit sentence events based on stream time consumed.
+    _offlineTimelineTimer?.cancel();
+    _offlineTimelineTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
+      if (!_offlineActive || _audioSource == null) return;
+      try {
+        final consumed = _soloud.getStreamTimeConsumed(_audioSource!).inMilliseconds;
+        final t = consumed + _offlineStartMs;
+        while (_offlineTimelineIdx < _offlineTimeline.length) {
+          final item = _offlineTimeline[_offlineTimelineIdx];
+          final ms = (item['ms'] as num?)?.toInt() ?? 0;
+          if (ms > t) break;
+          _offlineTimelineIdx++;
+          _eventsController.add({
+            'type': 'sentence',
+            'text': (item['text'] as String?) ?? '',
+            'paragraph_index': (item['p'] as num?)?.toInt() ?? 0,
+            'sentence_index': (item['s'] as num?)?.toInt() ?? 0,
+          });
+        }
+      } catch (_) {
+        // ignore
+      }
+    });
+
+    // Stream PCM from SAF into SoLoud buffer.
+    final handle = await AndroidSaf.openRead(treeUri: treeUri, pathSegments: pcmPath);
+    if (handle <= 0) {
+      _eventsController.add({'type': 'error', 'message': 'Failed to open downloaded audio'});
+      return;
+    }
+    _offlineReadHandle = handle;
+
+    final skipBytes = ((_offlineStartMs / 1000.0) * sampleRate * 2).round();
+    var skipped = 0;
+
+    var chunkCount = 0;
+    try {
+      while (_offlineActive) {
+        final chunk = await AndroidSaf.read(handle, maxBytes: 64 * 1024);
+        if (chunk == null || chunk.isEmpty) break;
+        if (skipped < skipBytes) {
+          final remain = skipBytes - skipped;
+          if (chunk.length <= remain) {
+            skipped += chunk.length;
+            continue;
+          }
+          final sliced = chunk.sublist(remain);
+          skipped = skipBytes;
+          if (sliced.isNotEmpty) {
+            final aligned = _alignPcm16(sliced);
+            if (aligned.isNotEmpty) {
+              _soloud.addAudioDataStream(_audioSource!, aligned);
+            }
+          }
+          continue;
+        }
+
+        final aligned = _alignPcm16(chunk);
+        if (aligned.isNotEmpty) {
+          _soloud.addAudioDataStream(_audioSource!, aligned);
+        }
+
+        // Light pacing: prevents some devices/drivers from glitching when
+        // pushing large amounts of PCM immediately.
+        chunkCount++;
+        if ((chunkCount % 6) == 0) {
+          await Future<void>.delayed(const Duration(milliseconds: 2));
+        }
+      }
+
+      if (_audioSource != null) {
+        try {
+          _soloud.setDataIsEnded(_audioSource!);
+        } catch (_) {}
+      }
+
+      // Wait until playback finishes.
+      while (_offlineActive && _handle != null && _soloud.getIsValidVoiceHandle(_handle!)) {
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+      }
+
+      if (_offlineActive) {
+        _eventsController.add({'type': 'chapter_complete', 'next_url': null, 'prev_url': null});
+      }
+    } catch (e) {
+      _eventsController.add({'type': 'error', 'message': e.toString()});
+    } finally {
+      try {
+        await AndroidSaf.closeRead(handle);
+      } catch (_) {}
+      _offlineReadHandle = null;
+    }
+  }
+
+  @override
+  Future<void> setPlaybackSpeed(double speed) async {
+    if (_handle == null) return;
+    try {
+      _soloud.setRelativePlaySpeed(_handle!, speed);
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  @override
   Future<void> pause() async {
     if (!_connected || _channel == null) return;
     if (_paused) return;
@@ -235,6 +420,17 @@ class NovelStreamController implements ReaderStreamController {
 
   @override
   Future<void> stop() async {
+    _pcmCarryByte = null;
+    _offlineActive = false;
+    _offlineTimelineTimer?.cancel();
+    _offlineTimelineTimer = null;
+    if (_offlineReadHandle != null) {
+      try {
+        await AndroidSaf.closeRead(_offlineReadHandle!);
+      } catch (_) {}
+    }
+    _offlineReadHandle = null;
+
     _noAudioTimer?.cancel();
     _noAudioTimer = null;
     if (_channel != null) {
@@ -268,5 +464,22 @@ class NovelStreamController implements ReaderStreamController {
     _handle = null;
     _audioSource = null;
     _streamSampleRate = null;
+  }
+
+  Uint8List _alignPcm16(Uint8List bytes) {
+    if (bytes.isEmpty) return bytes;
+    var chunk = bytes;
+    if (_pcmCarryByte != null) {
+      final merged = Uint8List(chunk.length + 1);
+      merged[0] = _pcmCarryByte!;
+      merged.setRange(1, merged.length, chunk);
+      _pcmCarryByte = null;
+      chunk = merged;
+    }
+    if (chunk.length.isOdd) {
+      _pcmCarryByte = chunk.last;
+      return chunk.sublist(0, chunk.length - 1);
+    }
+    return chunk;
   }
 }
