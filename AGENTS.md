@@ -9,6 +9,8 @@ LN-TTS is a **backend-required** light-novel reader + TTS player.
   - Endpoints:
     - `GET /health`
     - `GET /voices`
+    - `GET /novel_index?url=...`
+    - `GET /novel_details?url=...` → returns cover URL (best-effort)
     - `GET /novel_meta?url=...` → returns `count` (max chapter number when detectable)
     - `GET /novel_chapter?url=...&n=...` → resolves by parsed chapter number when available
     - `WS /ws` → commands: `play`, `pause`, `resume`, `stop`
@@ -24,6 +26,7 @@ LN-TTS is a **backend-required** light-novel reader + TTS player.
 2) App resolves chapter URL via backend `GET /novel_chapter`.
 3) App opens WS and sends:
    - `{ "command": "play", "url": <chapter_url>, "voice": <id>, "speed": <x>, "prefetch": <n>, "start_paragraph": <idx> }`
+  - Offline downloads use the same WS command but add: `{ "realtime": false }` to disable frame pacing.
 4) Backend sends JSON events:
    - `chapter_info` (includes paragraphs + audio format)
    - `sentence` (for highlight)

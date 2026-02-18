@@ -60,6 +60,7 @@ uv run python server.py
 Server listens on `0.0.0.0:8000`.
 - Health: `GET http://<host>:8000/health`
 - Voices: `GET http://<host>:8000/voices`
+- Novel details (cover): `GET http://<host>:8000/novel_details?url=<novel_url>`
 - WebSocket: `ws://<host>:8000/ws`
 
 ### CPU-only
@@ -92,6 +93,21 @@ flutter pub get
 ```bash
 flutter run
 ```
+
+## Offline downloads (Android)
+
+Offline downloads are **Android-only** and use the Android **Storage Access Framework (SAF)**.
+
+- Settings → **Downloads storage** → choose a folder
+- In a novel’s chapter list:
+  - **Long-press** a chapter to start selecting
+  - Use **Clear** / **Download selected** (or use “Download all chapters”)
+
+Downloaded chapters are stored as:
+- Raw **PCM16 mono** audio (`audio.pcm`)
+- A small JSON `meta.json` containing paragraphs + a sentence timeline for highlight sync
+
+Backend WS `play` supports `realtime: false` which disables frame pacing so downloads finish quickly.
 
 ### Settings (using your phone with your PC as the server)
 
@@ -155,10 +171,75 @@ This repo also includes the required `flutter_soloud` Web bootstrap scripts in `
 ## Data flow (high level)
 
 - Frontend (Flutter) calls backend `GET /voices` to populate the voice list.
+- Frontend can call backend `GET /novel_details?url=...` to fetch a cover image URL (best-effort).
 - Frontend opens `WS /ws` and sends `{ "command": "play", "url": <chapter_url>, "voice": <id>, "speed": <x>, "start_paragraph": <idx> }`.
 - Backend scrapes the chapter, emits a `chapter_info` JSON message (paragraphs + audio format), then streams PCM16 audio frames.
 - Backend emits `sentence` JSON messages for highlighting, including `paragraph_index` and `sentence_index`.
 - Frontend can send `{ "command": "pause" }`, `{ "command": "resume" }`, `{ "command": "stop" }` during playback.
+
+## Deploy backend to Azure (Container Apps)
+
+You’ll deploy a Docker image of the backend, push it to **Azure Container Registry (ACR)**, then run it in **Azure Container Apps**.
+
+### 1) Create resource group + ACR
+
+```bash
+az login
+az group create -n corereader-rg -l westeurope
+az acr create -n <acrName> -g corereader-rg --sku Basic
+```
+
+Get your registry login server (this is the “registry link”):
+
+```bash
+az acr show -n <acrName> -g corereader-rg --query loginServer -o tsv
+```
+
+### 2) Build + push image
+
+Option A (build in Azure, easiest):
+
+```bash
+az acr build -r <acrName> -t corereader-backend:v1 -f backend/Dockerfile backend
+```
+
+Your image tag to use in Azure will be:
+
+`<loginServer>/corereader-backend:v1`
+
+### 3) Deploy Container App (public HTTPS + WebSockets)
+
+```bash
+az extension add --name containerapp --upgrade
+az containerapp env create -g corereader-rg -n corereader-env -l westeurope
+
+loginServer=$(az acr show -n <acrName> -g corereader-rg --query loginServer -o tsv)
+
+az containerapp create \
+  -g corereader-rg \
+  -n corereader-backend \
+  --environment corereader-env \
+  --image "$loginServer/corereader-backend:v1" \
+  --ingress external \
+  --target-port 8000 \
+  --registry-server "$loginServer"
+```
+
+### 4) What URL do I put in the app?
+
+Get the public URL from Azure:
+
+```bash
+az containerapp show -g corereader-rg -n corereader-backend \
+  --query properties.configuration.ingress.fqdn -o tsv
+```
+
+- Your backend base URL will be: `https://<fqdn>`
+- The **WebSocket base URL to paste into Settings** is: `wss://<fqdn>`
+
+Notes:
+- First startup downloads models; allow extra time for the first boot.
+- If you change regions/names, the registry/image/url will change—use the commands above to retrieve the exact values.
 
 ## Local persistence (frontend)
 

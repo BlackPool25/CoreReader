@@ -1,16 +1,23 @@
-# frontend
+# CoreReader (Flutter frontend)
 
-A new Flutter project.
+This is the Flutter UI/player for LN-TTS.
 
-## Getting Started
+The app requires the backend to be running (no on-device TTS).
 
-This project is a starting point for a Flutter application.
+## Run
 
-A few resources to get you started if this is your first Flutter project:
+```bash
+flutter pub get
+flutter run
+```
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+## Backend URL
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Settings → **WebSocket base URL**
+
+Examples:
+- Local dev (same machine): `ws://localhost:8000`
+- Android emulator: `ws://10.0.2.2:8000`
+- Physical phone on Wi-Fi: `ws://<your-pc-lan-ip>:8000`
+- Azure Container Apps (HTTPS): `wss://<your-app-fqdn>`
+- Hugging Face Spaces (HTTPS): `wss://<space-subdomain>.hf.space`
