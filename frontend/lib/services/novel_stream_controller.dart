@@ -131,11 +131,39 @@ class NovelStreamController implements ReaderStreamController {
   }
 
   @override
+  // Pending sentence events from live stream, to be fired based on playback position.
+  final _pendingLiveSentences = <Map<String, dynamic>>[];
+  Timer? _liveTimelineTimer;
+
+  void _startLiveTimeline() {
+    _liveTimelineTimer?.cancel();
+    _liveTimelineTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
+      if (_audioSource == null || _pendingLiveSentences.isEmpty) return;
+      try {
+        final consumed = _soloud.getStreamTimeConsumed(_audioSource!).inMilliseconds;
+        while (_pendingLiveSentences.isNotEmpty) {
+          final evt = _pendingLiveSentences.first;
+          final ms = (evt['ms_start'] as num?)?.toInt() ?? 0;
+          if (ms > consumed) break;
+          _pendingLiveSentences.removeAt(0);
+          _eventsController.add(evt);
+        }
+      } catch (_) {}
+    });
+  }
+
+  void _stopLiveTimeline() {
+    _liveTimelineTimer?.cancel();
+    _liveTimelineTimer = null;
+    _pendingLiveSentences.clear();
+  }
+
+  @override
   Future<void> connectAndPlay({
     required String url,
     required String voice,
     required double speed,
-    int prefetch = 3,
+    int prefetch = 6,
     int startParagraph = 0,
   }) async {
     await stop();
@@ -162,17 +190,29 @@ class NovelStreamController implements ReaderStreamController {
         if (event is String) {
           final obj = jsonDecode(event);
           if (obj is Map<String, dynamic>) {
+            // Sentence events with ms_start are queued and fired by the live
+            // timeline timer so highlights match actual playback position.
+            if (obj['type'] == 'sentence') {
+              if (obj.containsKey('ms_start')) {
+                _pendingLiveSentences.add(obj);
+              } else {
+                _eventsController.add(obj);
+              }
+              return;
+            }
             _eventsController.add(obj);
             if (obj['type'] == 'chapter_info') {
               final audio = (obj['audio'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
               final sampleRate = (audio['sample_rate'] as num?)?.toInt() ?? 24000;
               try {
                 await _ensureAudioStream(sampleRate);
+                _startLiveTimeline();
               } catch (e) {
                 _eventsController.add({'type': 'error', 'message': _formatAudioInitError(e)});
               }
             }
             if (obj['type'] == 'chapter_complete') {
+              _stopLiveTimeline();
               // Flush any pending PCM carry byte to keep sample alignment.
               if (_pcmCarryByte != null && _audioSource != null) {
                 try {
@@ -234,6 +274,7 @@ class NovelStreamController implements ReaderStreamController {
       'prefetch': prefetch,
       'frame_ms': 200,
       'start_paragraph': startParagraph,
+      'realtime': false,
     };
     _channel!.sink.add(jsonEncode(payload));
   }
@@ -455,6 +496,7 @@ class NovelStreamController implements ReaderStreamController {
   @override
   Future<void> stop() async {
     _pcmCarryByte = null;
+    _stopLiveTimeline();
     _offlineActive = false;
     _offlineTimelineTimer?.cancel();
     _offlineTimelineTimer = null;

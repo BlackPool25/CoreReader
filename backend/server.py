@@ -279,6 +279,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
 
                     last_key = None
+                    cumulative_samples = 0
+                    sample_rate = app.state.tts.sample_rate
                     try:
                         control_task: asyncio.Task[str] | None = asyncio.create_task(websocket.receive_text())
 
@@ -330,26 +332,25 @@ async def websocket_endpoint(websocket: WebSocket):
 
                             if cancel_event.is_set():
                                 break
+
                             key = (p_idx + start_paragraph, s_idx, sentence)
                             if key != last_key:
                                 last_key = key
+                                ms_start = (cumulative_samples * 1000) // sample_rate
                                 await websocket.send_json(
                                     {
                                         "type": "sentence",
                                         "text": sentence,
                                         "paragraph_index": int(p_idx + start_paragraph),
                                         "sentence_index": int(s_idx),
+                                        "ms_start": ms_start,
                                     }
                                 )
                             await websocket.send_bytes(audio_frame)
-
-                            # Pace frames close to real-time so UI updates (sentence highlighting)
-                            # match what is audible, even when synthesis runs faster than realtime.
-                            if realtime:
-                                try:
-                                    await asyncio.sleep(len(audio_frame) / (2 * app.state.tts.sample_rate))
-                                except Exception:
-                                    pass
+                            cumulative_samples += len(audio_frame) // 2
+                            # No real-time sleep: frames are sent as fast as synthesis
+                            # allows. The client fires highlights via ms_start +
+                            # getStreamTimeConsumed, so pacing here is not needed.
 
                         if control_task is not None:
                             control_task.cancel()
