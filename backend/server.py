@@ -252,15 +252,23 @@ async def websocket_endpoint(websocket: WebSocket):
                         start_paragraph = max(0, len(paragraphs) - 1)
 
                     paragraphs_slice = paragraphs[start_paragraph:] if start_paragraph else paragraphs
+
+                    # Provide total sentence count up-front for download/progress UIs.
+                    try:
+                        sentence_total = len(app.state.tts.split_paragraphs(paragraphs_slice))
+                    except Exception:
+                        sentence_total = None
                     await websocket.send_json(
                         {
                             "type": "chapter_info",
                             "title": title,
                             "url": url,
+                            "voice": voice,
                             "next_url": chapter.get("next_url"),
                             "prev_url": chapter.get("prev_url"),
                             "paragraphs": paragraphs,
                             "start_paragraph": start_paragraph,
+                            "sentence_total": sentence_total,
                             "audio": {
                                 "encoding": "pcm_s16le",
                                 "sample_rate": app.state.tts.sample_rate,

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
 import '../services/local_store.dart';
+import '../services/android_saf.dart';
 import '../services/settings_store.dart';
 import '../widgets/app_settings_scope.dart';
 import '../widgets/downloads_scope.dart';
@@ -28,6 +29,71 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
   final Set<int> _selected = {};
 
   bool _didSyncDownloads = false;
+
+  Future<String?> _ensureDownloadsFolder() async {
+    final settings = AppSettingsScope.of(context);
+    final existing = settings.downloadsTreeUri;
+    if (existing != null && existing.trim().isNotEmpty) return existing;
+
+    if (!AndroidSaf.isSupported) return null;
+    final uri = await AndroidSaf.pickDownloadsFolderTreeUri();
+    if (uri == null || uri.trim().isEmpty) return null;
+    try {
+      await AndroidSaf.persistTreePermission(uri);
+    } catch (_) {}
+    await settings.setDownloadsTreeUri(uri);
+    return uri;
+  }
+
+  Future<List<String>> _loadBackendVoices() async {
+    final settings = AppSettingsScope.of(context);
+    final base = settings.serverBaseUrl;
+    final uri = SettingsStore.httpUri(base, '/voices');
+    final res = await http.get(uri).timeout(const Duration(seconds: 10));
+    if (res.statusCode != 200) return const <String>[];
+    final decoded = jsonDecode(res.body);
+    final raw = decoded is Map ? decoded['voices'] : null;
+    if (raw is! List) return const <String>[];
+    return raw.map((e) => e.toString()).where((s) => s.trim().isNotEmpty).toList(growable: false);
+  }
+
+  Future<String?> _promptDownloadVoice({required List<String> voices}) async {
+    if (!mounted) return null;
+    final settings = AppSettingsScope.of(context);
+    final defaultVoice = settings.defaultVoice ?? 'af_bella';
+
+    var selected = '__default__';
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Download voice'),
+          content: StatefulBuilder(
+            builder: (context, setInner) {
+              return DropdownButtonFormField<String>(
+                initialValue: selected,
+                items: [
+                  DropdownMenuItem(value: '__default__', child: Text('Default ($defaultVoice)')),
+                  ...voices.map((v) => DropdownMenuItem(value: v, child: Text(v))),
+                ],
+                onChanged: (v) {
+                  if (v == null) return;
+                  setInner(() => selected = v);
+                },
+                decoration: const InputDecoration(border: OutlineInputBorder()),
+              );
+            },
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(context, selected), child: const Text('Use')),
+          ],
+        );
+      },
+    );
+    if (result == null) return null;
+    return result == '__default__' ? defaultVoice : result;
+  }
 
   @override
   void didChangeDependencies() {
@@ -145,40 +211,91 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
   }
 
   Future<void> _downloadMany(List<StoredChapter> chapters) async {
-    final settings = AppSettingsScope.of(context);
-    final treeUri = settings.downloadsTreeUri;
+    final treeUri = await _ensureDownloadsFolder();
     if (treeUri == null || treeUri.trim().isEmpty) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Set Downloads storage folder in Settings first')));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Choose a Downloads storage folder first')));
       return;
     }
+
+    List<String> voices;
+    try {
+      voices = await _loadBackendVoices();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to load voices: $e')));
+      return;
+    }
+    final voice = await _promptDownloadVoice(voices: voices);
+    if (!mounted) return;
+    if (voice == null || voice.trim().isEmpty) return;
+
+    var chosenVoice = voice.trim();
+    if (voices.isNotEmpty && !voices.contains(chosenVoice)) {
+      chosenVoice = voices.first;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Selected voice not available on backend; using $chosenVoice')),
+        );
+      }
+    }
+
+    final settings = AppSettingsScope.of(context);
     final downloads = DownloadsScope.of(context);
-    final voice = settings.defaultVoice ?? 'af_bella';
     final speed = settings.defaultSpeed;
 
-    setState(() => _busy = true);
-    var ok = 0;
+    var queued = 0;
     try {
       for (final c in chapters) {
         if (downloads.isDownloaded(widget.novel.id, c.n)) continue;
-        await downloads.downloadChapter(
-          treeUri: treeUri,
-          novelId: widget.novel.id,
-          chapterN: c.n,
-          chapterUrl: c.url,
-          voice: voice,
-          speed: speed,
+        unawaited(
+          downloads.enqueueDownloadChapter(
+            treeUri: treeUri,
+            novelId: widget.novel.id,
+            chapterN: c.n,
+            chapterUrl: c.url,
+            voice: chosenVoice,
+            speed: speed,
+            source: 'manual',
+          ),
         );
-        ok++;
+        queued++;
       }
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Downloaded $ok chapters')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Queued $queued downloads')));
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Download failed: $e')));
-    } finally {
-      if (mounted) setState(() => _busy = false);
     }
+  }
+
+  Future<void> _deleteSelectedDownloads() async {
+    final settings = AppSettingsScope.of(context);
+    final treeUri = settings.downloadsTreeUri;
+    if (treeUri == null || treeUri.trim().isEmpty) return;
+    final downloads = DownloadsScope.of(context);
+
+    final items = _selected.toList(growable: false);
+    for (final n in items) {
+      if (!downloads.isDownloaded(widget.novel.id, n)) continue;
+      try {
+        await downloads.deleteDownloadedChapter(treeUri: treeUri, novelId: widget.novel.id, chapterN: n);
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _downloadNext(int count) async {
+    final library = LibraryScope.of(context);
+    final cache = library.cacheFor(widget.novel.id);
+    final chapters = cache?.chapters ?? const <StoredChapter>[];
+    if (chapters.isEmpty) return;
+
+    final progress = library.progressFor(widget.novel.id);
+    final curN = progress?.chapterN ?? 0;
+    final next = chapters.where((c) => c.n > curN).toList(growable: false);
+    if (next.isEmpty) return;
+
+    await _downloadMany(next.take(count).toList(growable: false));
   }
 
   @override
@@ -208,30 +325,48 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
               }),
               icon: const Icon(Icons.close),
             ),
-            IconButton(
-              tooltip: 'Clear selection',
-              onPressed: _selected.isEmpty
-                  ? null
-                  : () => setState(() {
-                        _selected.clear();
-                      }),
-              icon: const Icon(Icons.clear_all),
-            ),
-            IconButton(
-              tooltip: 'Download selected',
-              onPressed: (_selected.isEmpty || _busy)
-                  ? null
-                  : () async {
-                      await _downloadMany(
-                        chapters.where((c) => _selected.contains(c.n)).toList(growable: false),
-                      );
-                      if (!mounted) return;
-                      setState(() {
-                        _selectMode = false;
-                        _selected.clear();
-                      });
-                    },
-              icon: const Icon(Icons.download),
+            PopupMenuButton<String>(
+              tooltip: 'Selection actions',
+              onSelected: (v) async {
+                switch (v) {
+                  case 'clear':
+                    setState(() => _selected.clear());
+                    break;
+                  case 'download':
+                    await _downloadMany(chapters.where((c) => _selected.contains(c.n)).toList(growable: false));
+                    if (!mounted) return;
+                    setState(() {
+                      _selectMode = false;
+                      _selected.clear();
+                    });
+                    break;
+                  case 'delete':
+                    await _deleteSelectedDownloads();
+                    if (!mounted) return;
+                    setState(() {
+                      _selectMode = false;
+                      _selected.clear();
+                    });
+                    break;
+                }
+              },
+              itemBuilder: (context) => [
+                PopupMenuItem(
+                  value: 'clear',
+                  enabled: _selected.isNotEmpty,
+                  child: const Text('Clear selection'),
+                ),
+                PopupMenuItem(
+                  value: 'download',
+                  enabled: _selected.isNotEmpty && !_busy,
+                  child: const Text('Download selected'),
+                ),
+                PopupMenuItem(
+                  value: 'delete',
+                  enabled: _selected.isNotEmpty && !_busy,
+                  child: const Text('Delete selected downloads'),
+                ),
+              ],
             ),
           ],
           IconButton(
@@ -248,6 +383,15 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
               switch (v) {
                 case 'download_all':
                   await _downloadMany(chapters);
+                  break;
+                case 'download_next_5':
+                  await _downloadNext(5);
+                  break;
+                case 'download_next_10':
+                  await _downloadNext(10);
+                  break;
+                case 'download_next_25':
+                  await _downloadNext(25);
                   break;
                 case 'delete_downloads':
                   final tree = settings.downloadsTreeUri;
@@ -297,6 +441,21 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
                 value: 'download_all',
                 enabled: chapters.isNotEmpty && !_busy,
                 child: const Text('Download all chapters'),
+              ),
+              PopupMenuItem(
+                value: 'download_next_5',
+                enabled: chapters.isNotEmpty && !_busy,
+                child: const Text('Download next 5 chapters'),
+              ),
+              PopupMenuItem(
+                value: 'download_next_10',
+                enabled: chapters.isNotEmpty && !_busy,
+                child: const Text('Download next 10 chapters'),
+              ),
+              PopupMenuItem(
+                value: 'download_next_25',
+                enabled: chapters.isNotEmpty && !_busy,
+                child: const Text('Download next 25 chapters'),
               ),
               const PopupMenuDivider(),
               PopupMenuItem(
@@ -473,6 +632,25 @@ class _ChapterRow extends StatelessWidget {
     final progress = library.progressFor(novelId);
     final read = progress?.completedChapters.contains(chapter.n) ?? false;
 
+    final downloads = DownloadsScope.of(context);
+    final downloading = downloads.isDownloading(novelId, chapter.n);
+    final job = downloads.jobFor(novelId, chapter.n);
+    final progressValue = job?.progress;
+
+    Widget? downloadIndicator;
+    if (downloaded) {
+      downloadIndicator = const Icon(Icons.check_circle);
+    } else if (downloading) {
+      downloadIndicator = SizedBox(
+        width: 22,
+        height: 22,
+        child: CircularProgressIndicator(
+          strokeWidth: 3,
+          value: progressValue,
+        ),
+      );
+    }
+
     return ListTile(
       title: Text('Chapter ${chapter.n}'),
       subtitle: chapter.title.isEmpty ? null : Text(chapter.title, maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -485,29 +663,38 @@ class _ChapterRow extends StatelessWidget {
       },
       trailing: selectMode
           ? (downloaded ? const Icon(Icons.download_done) : const SizedBox.shrink())
-          : PopupMenuButton<String>(
-              onSelected: (v) {
-                switch (v) {
-                  case 'read':
-                    library.markRead(novelId, chapter.n, read: true);
-                    break;
-                  case 'unread':
-                    library.markRead(novelId, chapter.n, read: false);
-                    break;
-                  case 'read_prev':
-                    library.markPrevAll(novelId, chapter.n, read: true);
-                    break;
-                  case 'unread_prev':
-                    library.markPrevAll(novelId, chapter.n, read: false);
-                    break;
-                }
-              },
-              itemBuilder: (context) => const [
-                PopupMenuItem(value: 'read', child: Text('Mark as read')),
-                PopupMenuItem(value: 'read_prev', child: Text('Mark previous all as read')),
-                PopupMenuDivider(),
-                PopupMenuItem(value: 'unread', child: Text('Mark as unread')),
-                PopupMenuItem(value: 'unread_prev', child: Text('Mark previous all as unread')),
+          : Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (downloadIndicator != null) ...[
+                  downloadIndicator,
+                  const SizedBox(width: 8),
+                ],
+                PopupMenuButton<String>(
+                  onSelected: (v) {
+                    switch (v) {
+                      case 'read':
+                        library.markRead(novelId, chapter.n, read: true);
+                        break;
+                      case 'unread':
+                        library.markRead(novelId, chapter.n, read: false);
+                        break;
+                      case 'read_prev':
+                        library.markPrevAll(novelId, chapter.n, read: true);
+                        break;
+                      case 'unread_prev':
+                        library.markPrevAll(novelId, chapter.n, read: false);
+                        break;
+                    }
+                  },
+                  itemBuilder: (context) => const [
+                    PopupMenuItem(value: 'read', child: Text('Mark as read')),
+                    PopupMenuItem(value: 'read_prev', child: Text('Mark previous all as read')),
+                    PopupMenuDivider(),
+                    PopupMenuItem(value: 'unread', child: Text('Mark as unread')),
+                    PopupMenuItem(value: 'unread_prev', child: Text('Mark previous all as unread')),
+                  ],
+                ),
               ],
             ),
     );
@@ -542,6 +729,11 @@ class _ChapterTile extends StatelessWidget {
     final progress = library.progressFor(novelId);
     final read = progress?.completedChapters.contains(chapter.n) ?? false;
 
+    final downloads = DownloadsScope.of(context);
+    final downloading = downloads.isDownloading(novelId, chapter.n);
+    final job = downloads.jobFor(novelId, chapter.n);
+    final progressValue = job?.progress;
+
     return InkWell(
       borderRadius: BorderRadius.circular(16),
       onTap: onOpen,
@@ -570,7 +762,13 @@ class _ChapterTile extends StatelessWidget {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              if (!selectMode && downloaded) const Icon(Icons.download_done, size: 18),
+              if (!selectMode && downloaded) const Icon(Icons.check_circle, size: 18),
+              if (!selectMode && !downloaded && downloading)
+                SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 3, value: progressValue),
+                ),
             ],
           ),
         ),

@@ -109,6 +109,29 @@ class NovelCoolScraper:
         links = []
         seen = set()
 
+        def parse_chapter_number(title: str, url: str) -> int | None:
+            t = (title or '').strip()
+            # Best-effort chapter number parsing from visible text.
+            m = re.search(r"(?:\bChapter\b|\bCh\.?\b|\bC\b)\s*(\d+)", t, flags=re.IGNORECASE)
+            if m:
+                try:
+                    n = int(m.group(1))
+                    return n if n > 0 else None
+                except Exception:
+                    pass
+
+            # Fallback: parse from URL, e.g.
+            # /chapter/<Novel>-Chapter-15/<id>/ or .../Chapter_15/... etc.
+            u = (url or '')
+            m = re.search(r"(?:chapter|ch)[^0-9]{0,12}(\d+)", u, flags=re.IGNORECASE)
+            if m:
+                try:
+                    n = int(m.group(1))
+                    return n if n > 0 else None
+                except Exception:
+                    pass
+            return None
+
         for a in soup.find_all('a', href=True):
             href = a.get('href')
             if not href:
@@ -123,18 +146,16 @@ class NovelCoolScraper:
             if not title:
                 # Some chapter links have empty text (icons). Skip.
                 continue
-            # Best-effort chapter number parsing.
-            m = re.search(r"(?:Chapter|C)\s*(\d+)", title, flags=re.IGNORECASE)
-            n = int(m.group(1)) if m else None
+            n = parse_chapter_number(title, abs_url)
             links.append({"n": n, "title": title, "url": abs_url})
 
-        # Sort by chapter number when possible.
+        # Sort by chapter number when possible, but preserve stable ordering
+        # for unknowns (avoid pushing an unparsed Chapter 1 to the end).
         def chapter_key(item):
             n = item.get('n')
             if isinstance(n, int):
-                return n
-            # fallback: keep stable ordering
-            return 10**9
+                return (0, n)
+            return (1, 0)
 
         links.sort(key=chapter_key)
         return links

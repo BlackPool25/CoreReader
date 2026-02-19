@@ -196,6 +196,7 @@ class ReaderScreenState extends State<ReaderScreen> {
         _nextUrl = e['next_url'] as String?;
         _prevUrl = e['prev_url'] as String?;
         _busy = false;
+        _playingOffline = false;
       });
 
       final library = LibraryScope.of(context);
@@ -309,7 +310,7 @@ class ReaderScreenState extends State<ReaderScreen> {
     final downloads = DownloadsScope.of(context);
     final ahead = settings.downloadsPrefetchAhead;
     final behind = settings.downloadsKeepBehind;
-    final voice = settings.defaultVoice ?? 'af_bella';
+    final voice = _effectiveVoice;
     final speed = settings.defaultSpeed;
 
     // Queue ahead.
@@ -331,16 +332,22 @@ class ReaderScreenState extends State<ReaderScreen> {
               chapterUrl: next.url,
               voice: voice,
               speed: speed,
+              source: 'auto',
             );
           } catch (_) {}
         }(),
       );
     }
 
-    // Auto-delete behind.
+    // Auto-delete behind (only chapters that were auto-downloaded).
     final minKeep = _chapter.n - behind;
     if (minKeep <= 1) return;
-    final toDelete = downloads.chaptersForNovel(widget.novel.id).where((c) => c.chapterN < minKeep).toList(growable: false);
+    final toDelete = downloads
+        .chaptersForNovel(widget.novel.id)
+        .where((c) => c.chapterN < minKeep)
+        .where((c) => c.source == 'auto')
+        .where((c) => !downloads.isDownloading(widget.novel.id, c.chapterN))
+        .toList(growable: false);
     for (final c in toDelete) {
       unawaited(downloads.deleteDownloadedChapter(treeUri: tree, novelId: widget.novel.id, chapterN: c.chapterN).catchError((_) {}));
     }
@@ -416,9 +423,10 @@ class ReaderScreenState extends State<ReaderScreen> {
                 _showNowReading = result.showNowReading;
                 _autoScroll = result.autoScroll;
               });
-              if (_stream.connected) {
+              if (_stream.active) {
                 if (_playingOffline) {
-                  await _stream.setPlaybackSpeed(_effectiveSpeed);
+                  // Speed is baked into the downloaded PCM; a re-download is
+                  // needed for a different speed. No-op here.
                 } else {
                   await _restartFromCurrentParagraph();
                 }
@@ -496,12 +504,12 @@ class ReaderScreenState extends State<ReaderScreen> {
               child: Row(
                 children: [
                   IconButton(
-                    onPressed: _stream.connected
+                    onPressed: _stream.active
                         ? _pauseOrResume
                         : (_busy ? null : () => unawaited(_playChapter(_chapter, startParagraph: widget.startParagraph))),
                     iconSize: 30,
                     icon: Icon(
-                      _stream.connected && !_stream.paused ? Icons.pause : Icons.play_arrow,
+                      _stream.active && !_stream.paused ? Icons.pause : Icons.play_arrow,
                     ),
                   ),
                   IconButton(

@@ -8,6 +8,7 @@ class DownloadedChapter {
     required this.sampleRate,
     required this.voice,
     required this.ttsSpeed,
+    required this.source,
     required this.pcmPath,
     required this.metaPath,
   });
@@ -21,6 +22,11 @@ class DownloadedChapter {
   final int sampleRate;
   final String voice;
   final double ttsSpeed;
+
+  /// Where this download came from.
+  /// - manual: user-triggered
+  /// - auto: queued by auto-download
+  final String source;
 
   /// Storage-relative path segments under the configured downloads root.
   /// Example: ["LN-TTS", novelId, "chapters", "12", "audio.pcm"]
@@ -38,6 +44,7 @@ class DownloadedChapter {
         'sampleRate': sampleRate,
         'voice': voice,
         'ttsSpeed': ttsSpeed,
+        'source': source,
         'pcmPath': pcmPath,
         'metaPath': metaPath,
       };
@@ -54,6 +61,7 @@ class DownloadedChapter {
       sampleRate: (json['sampleRate'] as num?)?.toInt() ?? 24000,
       voice: (json['voice'] as String?) ?? '',
       ttsSpeed: (json['ttsSpeed'] as num?)?.toDouble() ?? 1.0,
+      source: (json['source'] as String?) ?? 'manual',
       pcmPath: pcm,
       metaPath: meta,
     );
@@ -97,6 +105,8 @@ class DownloadedChapterMeta {
     required this.sampleRate,
     required this.voice,
     required this.ttsSpeed,
+    required this.complete,
+    required this.source,
     required this.paragraphs,
     required this.timeline,
   });
@@ -106,6 +116,8 @@ class DownloadedChapterMeta {
   final int sampleRate;
   final String voice;
   final double ttsSpeed;
+  final bool complete;
+  final String source;
   final List<String> paragraphs;
   final List<ChapterTimelineItem> timeline;
 
@@ -116,6 +128,8 @@ class DownloadedChapterMeta {
         'sampleRate': sampleRate,
         'voice': voice,
         'ttsSpeed': ttsSpeed,
+      'complete': complete,
+      'source': source,
         'paragraphs': paragraphs,
         'timeline': timeline.map((e) => e.toJson()).toList(growable: false),
       };
@@ -139,6 +153,8 @@ class DownloadedChapterMeta {
       sampleRate: (json['sampleRate'] as num?)?.toInt() ?? 24000,
       voice: (json['voice'] as String?) ?? '',
       ttsSpeed: (json['ttsSpeed'] as num?)?.toDouble() ?? 1.0,
+      complete: (json['complete'] as bool?) ?? true,
+      source: (json['source'] as String?) ?? 'manual',
       paragraphs: paras,
       timeline: timeline,
     );

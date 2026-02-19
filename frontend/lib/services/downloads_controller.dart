@@ -9,9 +9,43 @@ import 'downloads_store.dart';
 import 'settings_store.dart';
 import 'ws_binary_to_bytes.dart';
 
+enum DownloadJobStatus {
+  queued,
+  downloading,
+  completed,
+  failed,
+}
+
+class DownloadJob {
+  DownloadJob({
+    required this.novelId,
+    required this.chapterN,
+    required this.chapterUrl,
+    required this.voice,
+    required this.speed,
+    required this.source,
+    required this.status,
+    required this.progress,
+    this.error,
+  });
+
+  final String novelId;
+  final int chapterN;
+  final String chapterUrl;
+  final String voice;
+  final double speed;
+  final String source;
+
+  DownloadJobStatus status;
+  double? progress; // null => indeterminate
+  String? error;
+}
+
 class DownloadsController extends ChangeNotifier {
   Map<String, List<DownloadedChapter>> _index = const {};
   bool _loaded = false;
+
+  final Map<String, DownloadJob> _jobsByKey = {};
 
   Future<void> _downloadChain = Future<void>.value();
   bool _downloading = false;
@@ -19,6 +53,15 @@ class DownloadsController extends ChangeNotifier {
   bool get downloading => _downloading;
 
   bool get loaded => _loaded;
+
+  String _jobKey(String novelId, int chapterN) => '$novelId:$chapterN';
+
+  DownloadJob? jobFor(String novelId, int chapterN) => _jobsByKey[_jobKey(novelId, chapterN)];
+
+  bool isDownloading(String novelId, int chapterN) {
+    final j = jobFor(novelId, chapterN);
+    return j != null && (j.status == DownloadJobStatus.queued || j.status == DownloadJobStatus.downloading);
+  }
 
   Future<void> load() async {
     _index = await DownloadsStore.loadIndex();
@@ -79,10 +122,15 @@ class DownloadsController extends ChangeNotifier {
 
       if (hasPcm && hasMeta) {
         final meta = await _loadMetaAtPath(treeUri: t, metaPath: metaPath);
+        // Ignore incomplete downloads (keep on disk; do not surface as downloaded).
+        if (meta != null && meta.complete == false) {
+          continue;
+        }
         final title = meta?.title ?? 'Chapter $n';
         final sampleRate = meta?.sampleRate ?? 24000;
         final voice = meta?.voice ?? 'af_bella';
         final ttsSpeed = meta?.ttsSpeed ?? 1.0;
+        final source = meta?.source ?? 'manual';
         scanned[n] = DownloadedChapter(
           novelId: novelId,
           chapterN: n,
@@ -92,17 +140,13 @@ class DownloadsController extends ChangeNotifier {
           sampleRate: sampleRate,
           voice: voice,
           ttsSpeed: ttsSpeed,
+          source: source,
           pcmPath: pcmPath,
           metaPath: metaPath,
         );
       } else {
-        // Incomplete chapter: clean up to avoid untracked leftovers.
-        try {
-          if (hasPcm) await AndroidSaf.delete(treeUri: t, pathSegments: pcmPath);
-        } catch (_) {}
-        try {
-          if (hasMeta) await AndroidSaf.delete(treeUri: t, pathSegments: metaPath);
-        } catch (_) {}
+        // Incomplete chapter on disk.
+        // We intentionally do NOT delete here because downloads may be in-flight.
       }
     }
 
@@ -192,6 +236,7 @@ class DownloadsController extends ChangeNotifier {
     required String chapterUrl,
     required String voice,
     required double speed,
+    String source = 'manual',
     int prefetchSentences = 8,
   }) async {
     if (kIsWeb) throw Exception('Downloads are not supported on Web');
@@ -200,6 +245,44 @@ class DownloadsController extends ChangeNotifier {
 
     final pcmPath = _pcmPath(novelId, chapterN);
     final metaPath = _metaPath(novelId, chapterN);
+
+    // Ensure we start from a clean slate (some SAF providers may not truncate
+    // reliably on overwrite, which can sound like jitter/corruption).
+    try {
+      await AndroidSaf.delete(treeUri: treeUri, pathSegments: pcmPath);
+    } catch (_) {}
+    try {
+      await AndroidSaf.delete(treeUri: treeUri, pathSegments: metaPath);
+    } catch (_) {}
+
+    // Write a placeholder meta immediately so reconcile doesn't treat the chapter
+    // as incomplete and delete the audio while we're still downloading.
+    try {
+      final placeholder = DownloadedChapterMeta(
+        title: 'Chapter $chapterN',
+        url: chapterUrl,
+        sampleRate: 24000,
+        voice: voice,
+        ttsSpeed: speed,
+        complete: false,
+        source: source,
+        paragraphs: const <String>[],
+        timeline: const <ChapterTimelineItem>[],
+      );
+      final bytes = utf8.encode(jsonEncode(placeholder.toJson()));
+      final metaHandle = await AndroidSaf.openWrite(
+        treeUri: treeUri,
+        pathSegments: metaPath,
+        mimeType: 'application/json',
+        append: false,
+      );
+      if (metaHandle > 0) {
+        await AndroidSaf.write(metaHandle, Uint8List.fromList(bytes));
+        await AndroidSaf.closeWrite(metaHandle);
+      }
+    } catch (_) {
+      // Best-effort.
+    }
 
     final pcmHandle = await AndroidSaf.openWrite(
       treeUri: treeUri,
@@ -215,8 +298,12 @@ class DownloadsController extends ChangeNotifier {
     int? pendingByte;
     var title = 'Chapter $chapterN';
     var sampleRate = 24000;
+    var effectiveVoice = voice;
     final paragraphs = <String>[];
     final timeline = <ChapterTimelineItem>[];
+
+    var sentenceTotal = 0;
+    var sentencesSeen = 0;
 
     try {
       final base = await SettingsStore.getServerBaseUrl();
@@ -244,8 +331,14 @@ class DownloadsController extends ChangeNotifier {
               final type = obj['type']?.toString();
               if (type == 'chapter_info') {
                 title = (obj['title'] as String?) ?? title;
+                final v = (obj['voice'] as String?)?.trim();
+                if (v != null && v.isNotEmpty) {
+                  effectiveVoice = v;
+                }
                 final audio = (obj['audio'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
                 sampleRate = (audio['sample_rate'] as num?)?.toInt() ?? 24000;
+                final st = (obj['sentence_total'] as num?)?.toInt();
+                sentenceTotal = (st != null && st > 0) ? st : 0;
                 final paras = (obj['paragraphs'] as List?)?.map((e) => e.toString()).toList() ?? const <String>[];
                 paragraphs
                   ..clear()
@@ -256,6 +349,19 @@ class DownloadsController extends ChangeNotifier {
                 final s = (obj['sentence_index'] as num?)?.toInt() ?? 0;
                 final ms = ((bytesWritten / 2) / sampleRate * 1000).round();
                 timeline.add(ChapterTimelineItem(ms: ms, text: text, paragraphIndex: p, sentenceIndex: s));
+
+                // Progress is based on sentence count, not bytes.
+                sentencesSeen++;
+                final key = _jobKey(novelId, chapterN);
+                final job = _jobsByKey[key];
+                if (job != null && job.status == DownloadJobStatus.downloading) {
+                  if (sentenceTotal > 0) {
+                    job.progress = (sentencesSeen / sentenceTotal).clamp(0.0, 1.0);
+                  } else {
+                    job.progress = null;
+                  }
+                  notifyListeners();
+                }
               } else if (type == 'chapter_complete') {
                 done.complete();
               } else if (type == 'error') {
@@ -307,12 +413,23 @@ class DownloadsController extends ChangeNotifier {
       await writeChain;
       await sub.cancel();
 
+      // If we ended with a dangling PCM byte, pad it to avoid truncating a sample.
+      if (pendingByte != null) {
+        try {
+          await AndroidSaf.write(pcmHandle, Uint8List.fromList([pendingByte!, 0]));
+          bytesWritten += 2;
+        } catch (_) {}
+        pendingByte = null;
+      }
+
       final meta = DownloadedChapterMeta(
         title: title,
         url: chapterUrl,
         sampleRate: sampleRate,
-        voice: voice,
+        voice: effectiveVoice,
         ttsSpeed: speed,
+        complete: true,
+        source: source,
         paragraphs: paragraphs,
         timeline: timeline,
       );
@@ -334,8 +451,9 @@ class DownloadsController extends ChangeNotifier {
         chapterUrl: chapterUrl,
         createdAtMs: DateTime.now().millisecondsSinceEpoch,
         sampleRate: sampleRate,
-        voice: voice,
+        voice: effectiveVoice,
         ttsSpeed: speed,
+        source: source,
         pcmPath: pcmPath,
         metaPath: metaPath,
       );
@@ -390,10 +508,29 @@ class DownloadsController extends ChangeNotifier {
     required String chapterUrl,
     required String voice,
     required double speed,
+    String source = 'manual',
   }) {
+    final key = _jobKey(novelId, chapterN);
+    _jobsByKey[key] = DownloadJob(
+      novelId: novelId,
+      chapterN: chapterN,
+      chapterUrl: chapterUrl,
+      voice: voice,
+      speed: speed,
+      source: source,
+      status: DownloadJobStatus.queued,
+      progress: null,
+    );
+    notifyListeners();
+
     final completer = Completer<DownloadedChapter>();
     _downloadChain = _downloadChain.then((_) async {
       _downloading = true;
+      final job = _jobsByKey[key];
+      if (job != null) {
+        job.status = DownloadJobStatus.downloading;
+        job.progress = 0.0;
+      }
       notifyListeners();
       try {
         final c = await downloadChapter(
@@ -403,9 +540,21 @@ class DownloadsController extends ChangeNotifier {
           chapterUrl: chapterUrl,
           voice: voice,
           speed: speed,
+          source: source,
         );
+        final job2 = _jobsByKey[key];
+        if (job2 != null) {
+          job2.status = DownloadJobStatus.completed;
+          job2.progress = 1.0;
+        }
         completer.complete(c);
       } catch (e, st) {
+        final job2 = _jobsByKey[key];
+        if (job2 != null) {
+          job2.status = DownloadJobStatus.failed;
+          job2.progress = null;
+          job2.error = e.toString();
+        }
         completer.completeError(e, st);
       } finally {
         _downloading = false;

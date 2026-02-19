@@ -18,7 +18,6 @@ class ChapterInfo {
     required this.prevUrl,
     required this.sampleRate,
   });
-
   final String title;
   final String url;
   final String? nextUrl;
@@ -57,6 +56,9 @@ class NovelStreamController implements ReaderStreamController {
   bool _connected = false;
   @override
   bool get connected => _connected;
+
+  @override
+  bool get active => _connected || _offlineActive;
 
   bool _paused = false;
   @override
@@ -118,7 +120,7 @@ class NovelStreamController implements ReaderStreamController {
       format: BufferType.s16le,
       bufferingType: BufferingType.released,
       // More headroom reduces audible gaps when synthesis/network jitter occurs.
-      bufferingTimeNeeds: 1.0,
+      bufferingTimeNeeds: 2.0,
       maxBufferSizeDuration: const Duration(minutes: 30),
     );
     final handle = await _soloud.play(src);
@@ -171,6 +173,16 @@ class NovelStreamController implements ReaderStreamController {
               }
             }
             if (obj['type'] == 'chapter_complete') {
+              // Flush any pending PCM carry byte to keep sample alignment.
+              if (_pcmCarryByte != null && _audioSource != null) {
+                try {
+                  final padded = Uint8List.fromList([_pcmCarryByte!, 0]);
+                  _pcmCarryByte = null;
+                  _soloud.addAudioDataStream(_audioSource!, padded);
+                } catch (_) {
+                  // ignore
+                }
+              }
               if (_audioSource != null) {
                 try {
                   _soloud.setDataIsEnded(_audioSource!);
@@ -266,7 +278,16 @@ class NovelStreamController implements ReaderStreamController {
     }
 
     _offlineTimeline = timeline;
+    // Pre-advance past events that precede the start offset so the first timer
+    // tick does not fire a catch-up burst of stale highlights.
     _offlineTimelineIdx = 0;
+    if (_offlineStartMs > 0) {
+      while (_offlineTimelineIdx < timeline.length) {
+        final ms = (timeline[_offlineTimelineIdx]['ms'] as num?)?.toInt() ?? 0;
+        if (ms >= _offlineStartMs) break;
+        _offlineTimelineIdx++;
+      }
+    }
     _offlineActive = true;
 
     // Emit chapter_info (same shape as backend).
@@ -287,10 +308,10 @@ class NovelStreamController implements ReaderStreamController {
     });
 
     await _ensureAudioStream(sampleRate);
-    if (_handle != null) {
-      // Relative play speed affects audible rate (pitch shifts).
-      _soloud.setRelativePlaySpeed(_handle!, playbackSpeed);
-    }
+    // Do NOT call setRelativePlaySpeed here. The TTS speed is already baked
+    // into the PCM at download time. Applying it again would double the effect
+    // and engage SoLoud's linear interpolation resampler, causing crackling and
+    // pitch distortion. Playback always runs at 1.0× (the natural sample rate).
 
     // Start a timer to emit sentence events based on stream time consumed.
     _offlineTimelineTimer?.cancel();
@@ -362,6 +383,17 @@ class NovelStreamController implements ReaderStreamController {
         }
       }
 
+      // If we ended with a dangling byte, pad it to complete the last PCM16 sample.
+      if (_pcmCarryByte != null && _audioSource != null) {
+        try {
+          final padded = Uint8List.fromList([_pcmCarryByte!, 0]);
+          _pcmCarryByte = null;
+          _soloud.addAudioDataStream(_audioSource!, padded);
+        } catch (_) {
+          // ignore
+        }
+      }
+
       if (_audioSource != null) {
         try {
           _soloud.setDataIsEnded(_audioSource!);
@@ -398,10 +430,11 @@ class NovelStreamController implements ReaderStreamController {
 
   @override
   Future<void> pause() async {
-    if (!_connected || _channel == null) return;
     if (_paused) return;
     _paused = true;
-    _channel!.sink.add(jsonEncode({'command': 'pause'}));
+    if (_connected && _channel != null) {
+      _channel!.sink.add(jsonEncode({'command': 'pause'}));
+    }
     if (_handle != null) {
       _soloud.setPause(_handle!, true);
     }
@@ -409,13 +442,14 @@ class NovelStreamController implements ReaderStreamController {
 
   @override
   Future<void> resume() async {
-    if (!_connected || _channel == null) return;
     if (!_paused) return;
     _paused = false;
     if (_handle != null) {
       _soloud.setPause(_handle!, false);
     }
-    _channel!.sink.add(jsonEncode({'command': 'resume'}));
+    if (_connected && _channel != null) {
+      _channel!.sink.add(jsonEncode({'command': 'resume'}));
+    }
   }
 
   @override

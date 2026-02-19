@@ -101,13 +101,29 @@ Offline downloads are **Android-only** and use the Android **Storage Access Fram
 - Settings → **Downloads storage** → choose a folder
 - In a novel’s chapter list:
   - **Long-press** a chapter to start selecting
-  - Use **Clear** / **Download selected** (or use “Download all chapters”)
+  - Use **Download selected** (or use “Download all chapters”)
+  - Downloads run in the background (you can keep scrolling/reading)
+  - Downloading chapters show a right-side circular progress ring; downloaded chapters show a right-side tick
+
+When you start a download (single/batch), the app asks which voice to download with.
+It includes a **Default (settings)** option and applies the choice to the whole batch.
 
 Downloaded chapters are stored as:
 - Raw **PCM16 mono** audio (`audio.pcm`)
 - A small JSON `meta.json` containing paragraphs + a sentence timeline for highlight sync
 
+The configured SAF folder also stores app state under:
+- `LN-TTS/app_state/` (library, chapter cache, reading progress, downloads index)
+
+This makes backup/restore easy: copy that folder to a new device and re-select it.
+
 Backend WS `play` supports `realtime: false` which disables frame pacing so downloads finish quickly.
+
+### Offline playback notes
+
+- **TTS speed is baked into the downloaded PCM.** The voice speed selected at download time is permanently encoded in the audio. Changing the speed slider after downloading has no effect on offline chapters; re-download at the desired speed if you want a different rate.
+- **Highlight sync** for offline chapters is driven by a pre-recorded sentence timeline (stored in `meta.json`). Highlight accuracy matches streaming quality.
+- **Voice for auto-downloads** follows the session voice active in the Reader at the time the auto-download is triggered (not the saved default in Settings).
 
 ### Settings (using your phone with your PC as the server)
 

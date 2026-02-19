@@ -1,6 +1,11 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
+
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'android_saf.dart';
+import 'settings_store.dart';
 
 class StoredNovel {
   StoredNovel({
@@ -142,17 +147,112 @@ class LocalStore {
   static const _cachePrefix = 'novel_cache_v1:'; // + novelId
   static const _progressPrefix = 'reading_progress_v1:'; // + novelId
 
+  static const List<String> _safRoot = ['LN-TTS', 'app_state'];
+
+  static List<String> _safLibraryPath() => [..._safRoot, 'library.json'];
+  static List<String> _safCachePath(String novelId) => [..._safRoot, 'cache', '$novelId.json'];
+  static List<String> _safProgressPath(String novelId) => [..._safRoot, 'progress', '$novelId.json'];
+
+  static Future<String?> _treeUri() async {
+    if (kIsWeb) return null;
+    if (!AndroidSaf.isSupported) return null;
+    return await SettingsStore.getDownloadsTreeUri();
+  }
+
+  static Future<String?> _readSafText({required String treeUri, required List<String> path}) async {
+    final handle = await AndroidSaf.openRead(treeUri: treeUri, pathSegments: path);
+    if (handle <= 0) return null;
+    try {
+      final chunks = <int>[];
+      while (true) {
+        final bytes = await AndroidSaf.read(handle, maxBytes: 64 * 1024);
+        if (bytes == null || bytes.isEmpty) break;
+        chunks.addAll(bytes);
+      }
+      if (chunks.isEmpty) return null;
+      return utf8.decode(chunks);
+    } finally {
+      await AndroidSaf.closeRead(handle);
+    }
+  }
+
+  static Future<void> _writeSafText({
+    required String treeUri,
+    required List<String> path,
+    required String mimeType,
+    required String text,
+  }) async {
+    final handle = await AndroidSaf.openWrite(
+      treeUri: treeUri,
+      pathSegments: path,
+      mimeType: mimeType,
+      append: false,
+    );
+    if (handle <= 0) throw Exception('Failed to open SAF file for write');
+    try {
+      await AndroidSaf.write(handle, Uint8List.fromList(utf8.encode(text)));
+    } finally {
+      await AndroidSaf.closeWrite(handle);
+    }
+  }
+
   static Future<void> deleteNovelCache(String novelId) async {
+    final tree = await _treeUri();
+    if (tree != null && tree.trim().isNotEmpty) {
+      try {
+        await AndroidSaf.delete(treeUri: tree, pathSegments: _safCachePath(novelId));
+      } catch (_) {}
+      return;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('$_cachePrefix$novelId');
   }
 
   static Future<void> deleteProgress(String novelId) async {
+    final tree = await _treeUri();
+    if (tree != null && tree.trim().isNotEmpty) {
+      try {
+        await AndroidSaf.delete(treeUri: tree, pathSegments: _safProgressPath(novelId));
+      } catch (_) {}
+      return;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('$_progressPrefix$novelId');
   }
 
   static Future<List<StoredNovel>> loadLibrary() async {
+    final tree = await _treeUri();
+    if (tree != null && tree.trim().isNotEmpty) {
+      try {
+        final raw = await _readSafText(treeUri: tree, path: _safLibraryPath());
+        if (raw == null || raw.isEmpty) {
+          // Migration path: seed SAF storage from existing prefs.
+          final prefsNovels = await _loadLibraryFromPrefs();
+          if (prefsNovels.isNotEmpty) {
+            try {
+              await saveLibrary(prefsNovels);
+            } catch (_) {}
+          }
+          return prefsNovels;
+        }
+        final decoded = jsonDecode(raw);
+        if (decoded is! List) return const [];
+        return decoded
+            .whereType<Map>()
+            .map((m) => StoredNovel.fromJson(m.cast<String, dynamic>()))
+            .where((n) => n.id.isNotEmpty && n.novelUrl.isNotEmpty)
+            .toList(growable: false);
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    return _loadLibraryFromPrefs();
+  }
+
+  static Future<List<StoredNovel>> _loadLibraryFromPrefs() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_libraryKey);
     if (raw == null || raw.isEmpty) return const [];
@@ -170,12 +270,46 @@ class LocalStore {
   }
 
   static Future<void> saveLibrary(List<StoredNovel> novels) async {
+    final tree = await _treeUri();
+    if (tree != null && tree.trim().isNotEmpty) {
+      final raw = jsonEncode(novels.map((n) => n.toJson()).toList(growable: false));
+      await _writeSafText(treeUri: tree, path: _safLibraryPath(), mimeType: 'application/json', text: raw);
+      return;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     final raw = jsonEncode(novels.map((n) => n.toJson()).toList(growable: false));
     await prefs.setString(_libraryKey, raw);
   }
 
   static Future<StoredNovelCache?> loadNovelCache(String novelId) async {
+    final tree = await _treeUri();
+    if (tree != null && tree.trim().isNotEmpty) {
+      try {
+        final raw = await _readSafText(treeUri: tree, path: _safCachePath(novelId));
+        if (raw == null || raw.isEmpty) {
+          final prefsCache = await _loadNovelCacheFromPrefs(novelId);
+          if (prefsCache != null) {
+            try {
+              await saveNovelCache(novelId, prefsCache);
+            } catch (_) {}
+          }
+          return prefsCache;
+        }
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          return StoredNovelCache.fromJson(decoded.cast<String, dynamic>());
+        }
+      } catch (_) {
+        return null;
+      }
+      return null;
+    }
+
+    return _loadNovelCacheFromPrefs(novelId);
+  }
+
+  static Future<StoredNovelCache?> _loadNovelCacheFromPrefs(String novelId) async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString('$_cachePrefix$novelId');
     if (raw == null || raw.isEmpty) return null;
@@ -189,11 +323,49 @@ class LocalStore {
   }
 
   static Future<void> saveNovelCache(String novelId, StoredNovelCache cache) async {
+    final tree = await _treeUri();
+    if (tree != null && tree.trim().isNotEmpty) {
+      await _writeSafText(
+        treeUri: tree,
+        path: _safCachePath(novelId),
+        mimeType: 'application/json',
+        text: jsonEncode(cache.toJson()),
+      );
+      return;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('$_cachePrefix$novelId', jsonEncode(cache.toJson()));
   }
 
   static Future<StoredReadingProgress?> loadProgress(String novelId) async {
+    final tree = await _treeUri();
+    if (tree != null && tree.trim().isNotEmpty) {
+      try {
+        final raw = await _readSafText(treeUri: tree, path: _safProgressPath(novelId));
+        if (raw == null || raw.isEmpty) {
+          final prefsProgress = await _loadProgressFromPrefs(novelId);
+          if (prefsProgress != null) {
+            try {
+              await saveProgress(prefsProgress);
+            } catch (_) {}
+          }
+          return prefsProgress;
+        }
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          return StoredReadingProgress.fromJson(decoded.cast<String, dynamic>());
+        }
+      } catch (_) {
+        return null;
+      }
+      return null;
+    }
+
+    return _loadProgressFromPrefs(novelId);
+  }
+
+  static Future<StoredReadingProgress?> _loadProgressFromPrefs(String novelId) async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString('$_progressPrefix$novelId');
     if (raw == null || raw.isEmpty) return null;
@@ -207,6 +379,17 @@ class LocalStore {
   }
 
   static Future<void> saveProgress(StoredReadingProgress progress) async {
+    final tree = await _treeUri();
+    if (tree != null && tree.trim().isNotEmpty) {
+      await _writeSafText(
+        treeUri: tree,
+        path: _safProgressPath(progress.novelId),
+        mimeType: 'application/json',
+        text: jsonEncode(progress.toJson()),
+      );
+      return;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('$_progressPrefix${progress.novelId}', jsonEncode(progress.toJson()));
   }
