@@ -17,6 +17,20 @@ class TTSEngine:
         model_path: str = "models/kokoro-v1.0.onnx",
         voices_path: str = "models/voices-v1.0.bin",
     ):
+        # Resolve relative paths against this backend module directory, not the
+        # process working directory (important for serverless/ASGI hosts).
+        base_dir = Path(__file__).resolve().parent
+        mp = Path(model_path)
+        if not mp.is_absolute():
+            candidate = (base_dir / mp).resolve()
+            if candidate.exists():
+                model_path = str(candidate)
+        vp = Path(voices_path)
+        if not vp.is_absolute():
+            candidate = (base_dir / vp).resolve()
+            if candidate.exists():
+                voices_path = str(candidate)
+
         # Ensure models exist
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found at {model_path}. Run download_models.py first.")

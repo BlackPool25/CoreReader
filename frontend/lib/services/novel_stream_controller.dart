@@ -159,7 +159,6 @@ class NovelStreamController implements ReaderStreamController {
     _chunkPumpTimer = null;
   }
 
-  @override
   // Pending sentence events from live stream, to be fired based on playback position.
   final _pendingLiveSentences = <Map<String, dynamic>>[];
   Timer? _liveTimelineTimer;
@@ -177,6 +176,11 @@ class NovelStreamController implements ReaderStreamController {
         final maxPlayableMs = ((_enqueuedSamples * 1000) / sr).floor();
         final t = consumed <= maxPlayableMs ? consumed : maxPlayableMs;
         while (_pendingLiveSentences.isNotEmpty) {
+          // Do not advance sentence highlights unless we have enqueued the
+          // corresponding sentence audio chunk. On slow backends/networks,
+          // JSON sentence events can arrive ahead of the binary PCM chunk.
+          if ((_playedSentenceCount + 1) > _enqueuedSentenceCount) break;
+
           final evt = _pendingLiveSentences.first;
           final ms = (evt['ms_start'] as num?)?.toInt() ?? 0;
           if (ms > t) break;
