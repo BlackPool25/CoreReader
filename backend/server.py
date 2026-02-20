@@ -273,7 +273,10 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "encoding": "pcm_s16le",
                                 "sample_rate": app.state.tts.sample_rate,
                                 "channels": 1,
+                                # For backward-compatibility, keep frame_ms but note that
+                                # the stream is now sentence-chunked.
                                 "frame_ms": frame_ms,
+                                "chunking": "sentence",
                             },
                         }
                     )
@@ -283,6 +286,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     sample_rate = app.state.tts.sample_rate
                     try:
                         control_task: asyncio.Task[str] | None = asyncio.create_task(websocket.receive_text())
+
+                        stream_t0 = time.monotonic()
 
                         async def handle_control_payload(payload: str) -> None:
                             nonlocal paused
@@ -298,12 +303,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             elif cmd == "stop":
                                 cancel_event.set()
 
-                        async for p_idx, s_idx, sentence, audio_frame in app.state.tts.generate_audio_stream_paragraphs(
+                        async for p_idx, s_idx, sentence, audio_chunk in app.state.tts.generate_audio_stream_paragraphs_sentence_chunks(
                             paragraphs_slice,
                             voice=voice,
                             speed=speed,
                             prefetch_sentences=prefetch,
-                            frame_ms=frame_ms,
                             cancel_event=cancel_event,
                         ):
                             # Consume any pending control messages without concurrent receives.
@@ -346,11 +350,21 @@ async def websocket_endpoint(websocket: WebSocket):
                                         "ms_start": ms_start,
                                     }
                                 )
-                            await websocket.send_bytes(audio_frame)
-                            cumulative_samples += len(audio_frame) // 2
-                            # No real-time sleep: frames are sent as fast as synthesis
-                            # allows. The client fires highlights via ms_start +
-                            # getStreamTimeConsumed, so pacing here is not needed.
+                            await websocket.send_bytes(audio_chunk)
+                            cumulative_samples += len(audio_chunk) // 2
+
+                            # Optional realtime pacing.
+                            # - streaming: send roughly in-time to reduce client buffer bloat.
+                            # - downloads: realtime=false sends as fast as synthesis allows.
+                            if realtime:
+                                expected_s = cumulative_samples / float(sample_rate)
+                                elapsed_s = time.monotonic() - stream_t0
+                                # Let the stream run slightly ahead to avoid stutter from
+                                # small scheduling/network jitter.
+                                ahead_s = 0.10
+                                sleep_s = (expected_s - elapsed_s) - ahead_s
+                                if sleep_s > 0:
+                                    await asyncio.sleep(min(sleep_s, 0.25))
 
                         if control_task is not None:
                             control_task.cancel()

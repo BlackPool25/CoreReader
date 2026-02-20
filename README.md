@@ -146,7 +146,9 @@ Backend WS `play` supports `realtime: false` which disables frame pacing so down
   - scrapes the chapter text from the chapter content container (`div.site-content div.overflow-hidden`)
   - splits into sentences (paragraph-aware) and adds short pauses for more natural pacing
   - pre-synthesizes a few sentences ahead (prefetch) to reduce boundary pauses
-   - streams PCM16 audio frames over WebSocket
+   - streams **sentence-atomic** PCM16 chunks over WebSocket (one binary message per sentence)
+     - each chunk includes a small trailing pause
+     - each sentence audio gets a tiny fade-in/out to avoid boundary clicks
 5. The app plays audio immediately and highlights the currently spoken sentence (synced via sentence metadata from backend).
 
 > Note: This project is intended for personal/local use.
@@ -189,9 +191,15 @@ This repo also includes the required `flutter_soloud` Web bootstrap scripts in `
 - Frontend (Flutter) calls backend `GET /voices` to populate the voice list.
 - Frontend can call backend `GET /novel_details?url=...` to fetch a cover image URL (best-effort).
 - Frontend opens `WS /ws` and sends `{ "command": "play", "url": <chapter_url>, "voice": <id>, "speed": <x>, "start_paragraph": <idx> }`.
-- Backend scrapes the chapter, emits a `chapter_info` JSON message (paragraphs + audio format), then streams PCM16 audio frames.
+- Backend scrapes the chapter, emits a `chapter_info` JSON message (paragraphs + audio format), then streams PCM16 audio **sentence chunks**.
 - Backend emits `sentence` JSON messages for highlighting, including `paragraph_index` and `sentence_index`.
 - Frontend can send `{ "command": "pause" }`, `{ "command": "resume" }`, `{ "command": "stop" }` during playback.
+
+### Streaming vs downloads (important)
+
+- Live streaming sends `realtime: true` (default). The backend paces output loosely to avoid huge client buffer bloat.
+- Offline downloads send `realtime: false` so the backend sends as fast as synthesis allows.
+- Audio chunking is sentence-based, so if buffering happens it should pause **between sentences**, not mid-sentence.
 
 ## Deploy backend to Azure (Container Apps)
 

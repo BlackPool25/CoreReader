@@ -45,6 +45,15 @@ class NovelStreamController implements ReaderStreamController {
 
   int? _pcmCarryByte;
 
+  // Live stream sentence-audio queue.
+  final _pendingSentenceMeta = <Map<String, dynamic>>[];
+  final _receivedSentenceAudio = <Uint8List>[];
+  Timer? _chunkPumpTimer;
+  bool _remoteChapterComplete = false;
+  int _playedSentenceCount = 0;
+  int _enqueuedSentenceCount = 0;
+  static const int _targetSentenceLookahead = 3;
+
   // Offline playback state.
   Timer? _offlineTimelineTimer;
   int? _offlineReadHandle;
@@ -120,7 +129,9 @@ class NovelStreamController implements ReaderStreamController {
       format: BufferType.s16le,
       bufferingType: BufferingType.released,
       // More headroom reduces audible gaps when synthesis/network jitter occurs.
-      bufferingTimeNeeds: 2.0,
+      // Keep startup latency low; buffering pauses will happen at sentence boundaries
+      // because the backend streams sentence-atomic chunks.
+      bufferingTimeNeeds: 0.20,
       maxBufferSizeDuration: const Duration(minutes: 30),
     );
     final handle = await _soloud.play(src);
@@ -128,6 +139,15 @@ class NovelStreamController implements ReaderStreamController {
     _audioSource = src;
     _handle = handle;
     _streamSampleRate = sampleRate;
+
+    // Reset live-queue state when we recreate the stream.
+    _pendingSentenceMeta.clear();
+    _receivedSentenceAudio.clear();
+    _remoteChapterComplete = false;
+    _playedSentenceCount = 0;
+    _enqueuedSentenceCount = 0;
+    _chunkPumpTimer?.cancel();
+    _chunkPumpTimer = null;
   }
 
   @override
@@ -147,6 +167,12 @@ class NovelStreamController implements ReaderStreamController {
           if (ms > consumed) break;
           _pendingLiveSentences.removeAt(0);
           _eventsController.add(evt);
+
+          // Update played-sentence count (used to keep a small lookahead queue).
+          if (evt['type'] == 'sentence') {
+            _playedSentenceCount++;
+            _pumpSentenceAudio();
+          }
         }
       } catch (_) {}
     });
@@ -156,6 +182,51 @@ class NovelStreamController implements ReaderStreamController {
     _liveTimelineTimer?.cancel();
     _liveTimelineTimer = null;
     _pendingLiveSentences.clear();
+
+    _chunkPumpTimer?.cancel();
+    _chunkPumpTimer = null;
+    _pendingSentenceMeta.clear();
+    _receivedSentenceAudio.clear();
+    _remoteChapterComplete = false;
+    _playedSentenceCount = 0;
+    _enqueuedSentenceCount = 0;
+  }
+
+  void _pumpSentenceAudio() {
+    if (_audioSource == null) return;
+
+    // Enqueue enough audio to maintain a small sentence lookahead.
+    while (_receivedSentenceAudio.isNotEmpty && (_enqueuedSentenceCount - _playedSentenceCount) < _targetSentenceLookahead) {
+      final chunk = _receivedSentenceAudio.removeAt(0);
+      try {
+        final aligned = _alignPcm16(chunk);
+        if (aligned.isNotEmpty) {
+          _soloud.addAudioDataStream(_audioSource!, aligned);
+        }
+      } catch (_) {
+        // ignore
+      }
+      _enqueuedSentenceCount++;
+    }
+
+    // Finalize only when remote signaled completion AND we've drained our queue.
+    if (_remoteChapterComplete && _receivedSentenceAudio.isEmpty) {
+      // Flush any pending PCM carry byte to keep sample alignment.
+      if (_pcmCarryByte != null) {
+        try {
+          final padded = Uint8List.fromList([_pcmCarryByte!, 0]);
+          _pcmCarryByte = null;
+          _soloud.addAudioDataStream(_audioSource!, padded);
+        } catch (_) {
+          // ignore
+        }
+      }
+      try {
+        _soloud.setDataIsEnded(_audioSource!);
+      } catch (_) {
+        // ignore
+      }
+    }
   }
 
   @override
@@ -195,6 +266,10 @@ class NovelStreamController implements ReaderStreamController {
             if (obj['type'] == 'sentence') {
               if (obj.containsKey('ms_start')) {
                 _pendingLiveSentences.add(obj);
+
+                // Keep a parallel queue so we can associate the next binary chunk
+                // with this sentence.
+                _pendingSentenceMeta.add(obj);
               } else {
                 _eventsController.add(obj);
               }
@@ -212,22 +287,10 @@ class NovelStreamController implements ReaderStreamController {
               }
             }
             if (obj['type'] == 'chapter_complete') {
-              _stopLiveTimeline();
-              // Flush any pending PCM carry byte to keep sample alignment.
-              if (_pcmCarryByte != null && _audioSource != null) {
-                try {
-                  final padded = Uint8List.fromList([_pcmCarryByte!, 0]);
-                  _pcmCarryByte = null;
-                  _soloud.addAudioDataStream(_audioSource!, padded);
-                } catch (_) {
-                  // ignore
-                }
-              }
-              if (_audioSource != null) {
-                try {
-                  _soloud.setDataIsEnded(_audioSource!);
-                } catch (_) {}
-              }
+              // Mark completion; we finalize only after draining any locally
+              // queued sentence audio.
+              _remoteChapterComplete = true;
+              _pumpSentenceAudio();
             }
           }
           return;
@@ -248,10 +311,25 @@ class NovelStreamController implements ReaderStreamController {
         }
         if (_audioSource != null) {
           try {
-            final aligned = _alignPcm16(bytes);
-            if (aligned.isNotEmpty) {
-              _soloud.addAudioDataStream(_audioSource!, aligned);
+            // Backend sends one binary message per sentence chunk.
+            // Associate it with the oldest pending sentence meta (best-effort).
+            if (_pendingSentenceMeta.isNotEmpty) {
+              _pendingSentenceMeta.removeAt(0);
             }
+            _receivedSentenceAudio.add(bytes);
+
+            // Start a small pump to keep lookahead filled, without dumping all
+            // received data into the buffer at once.
+            _chunkPumpTimer ??= Timer.periodic(const Duration(milliseconds: 40), (_) {
+              if (!_connected || _audioSource == null) return;
+              _pumpSentenceAudio();
+              if (_remoteChapterComplete && _receivedSentenceAudio.isEmpty) {
+                _chunkPumpTimer?.cancel();
+                _chunkPumpTimer = null;
+              }
+            });
+
+            _pumpSentenceAudio();
           } catch (e) {
             _eventsController.add({'type': 'error', 'message': e.toString()});
           }
@@ -274,7 +352,8 @@ class NovelStreamController implements ReaderStreamController {
       'prefetch': prefetch,
       'frame_ms': 200,
       'start_paragraph': startParagraph,
-      'realtime': false,
+      // Streaming should be paced; downloads explicitly set realtime=false.
+      'realtime': true,
     };
     _channel!.sink.add(jsonEncode(payload));
   }
@@ -496,6 +575,13 @@ class NovelStreamController implements ReaderStreamController {
   @override
   Future<void> stop() async {
     _pcmCarryByte = null;
+    _pendingSentenceMeta.clear();
+    _receivedSentenceAudio.clear();
+    _remoteChapterComplete = false;
+    _playedSentenceCount = 0;
+    _enqueuedSentenceCount = 0;
+    _chunkPumpTimer?.cancel();
+    _chunkPumpTimer = null;
     _stopLiveTimeline();
     _offlineActive = false;
     _offlineTimelineTimer?.cancel();

@@ -121,11 +121,42 @@ class TTSEngine:
         for i in range(0, len(pcm16), frame_bytes):
             yield pcm16[i : i + frame_bytes]
 
+    def _apply_edge_fade_pcm16(self, pcm16: bytes, *, fade_ms: int = 6) -> bytes:
+        """Apply a short fade-in/out to reduce boundary clicks.
+
+        Kokoro is synthesized per sentence, so concatenation (or appending silence)
+        can produce discontinuities. A tiny edge fade is a minimal, cheap fix.
+        """
+        if not pcm16 or fade_ms <= 0:
+            return pcm16
+
+        samples = np.frombuffer(pcm16, dtype=np.int16)
+        n = int(samples.shape[0])
+        if n < 8:
+            return pcm16
+
+        fade_samples = int(self.sample_rate * (float(fade_ms) / 1000.0))
+        fade_samples = max(0, min(fade_samples, n // 2))
+        if fade_samples < 2:
+            return pcm16
+
+        # Work in float for clean scaling then back to int16.
+        x = samples.astype(np.float32)
+        ramp = np.linspace(0.0, 1.0, fade_samples, endpoint=False, dtype=np.float32)
+        x[:fade_samples] *= ramp
+        x[-fade_samples:] *= ramp[::-1]
+        x = np.clip(x, -32768.0, 32767.0)
+        return x.astype(np.int16).tobytes()
+
     async def synthesize_sentence_pcm16(self, sentence: str, voice: str, speed: float) -> bytes:
         loop = asyncio.get_running_loop()
         audio, _ = await loop.run_in_executor(None, self.kokoro.create, sentence, voice, speed)
         audio_int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
         return audio_int16.tobytes()
+
+    async def synthesize_sentence_pcm16_smoothed(self, sentence: str, voice: str, speed: float) -> bytes:
+        pcm16 = await self.synthesize_sentence_pcm16(sentence, voice=voice, speed=speed)
+        return self._apply_edge_fade_pcm16(pcm16)
 
     async def generate_audio_stream(
         self,
@@ -249,6 +280,87 @@ class TTSEngine:
                         if cancel_event is not None and cancel_event.is_set():
                             return
                         yield (p_idx, s_idx, sentence, frame)
+        finally:
+            producer_task.cancel()
+            with contextlib.suppress(Exception):
+                await producer_task
+
+    async def generate_audio_stream_paragraphs_sentence_chunks(
+        self,
+        paragraphs: List[str],
+        voice: str = "af_bella",
+        speed: float = 1.0,
+        prefetch_sentences: int = 3,
+        cancel_event: Optional[asyncio.Event] = None,
+        *,
+        pause_sentence_ms: int = 120,
+        pause_period_ms: int = 180,
+        pause_exclaim_ms: int = 200,
+        pause_question_ms: int = 260,
+        pause_paragraph_extra_ms: int = 240,
+        fade_ms: int = 6,
+    ) -> AsyncIterator[tuple[int, int, str, bytes]]:
+        """Yield sentence-atomic PCM chunks.
+
+        Returns (paragraph_index, sentence_index, sentence_text, pcm16_bytes).
+
+        Each yielded `pcm16_bytes` contains the full sentence audio (smoothed by
+        a short fade-in/out) *plus* a short silence pause appended.
+
+        This is designed so that if buffering is needed, playback can only pause
+        between sentences (at the end of the current chunk), not mid-sentence.
+        """
+
+        segments = self.split_paragraphs(paragraphs)
+        queue: asyncio.Queue[Optional[tuple[int, int, str, bytes, int]]] = asyncio.Queue(
+            maxsize=max(1, prefetch_sentences)
+        )
+
+        def pause_ms_for(sentence: str, is_last_in_paragraph: bool) -> int:
+            s = sentence.rstrip()
+            base = pause_sentence_ms
+            if s.endswith('?'):
+                base = pause_question_ms
+            elif s.endswith('!'):
+                base = pause_exclaim_ms
+            elif s.endswith('.'):
+                base = pause_period_ms
+            if is_last_in_paragraph:
+                base += pause_paragraph_extra_ms
+            return max(0, int(base))
+
+        async def producer() -> None:
+            try:
+                for p_idx, s_idx, s, is_last in segments:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    if not s:
+                        continue
+                    pcm16 = await self.synthesize_sentence_pcm16(s, voice=voice, speed=speed)
+                    if fade_ms and fade_ms > 0:
+                        pcm16 = self._apply_edge_fade_pcm16(pcm16, fade_ms=int(fade_ms))
+                    pause_ms = pause_ms_for(s, is_last)
+                    await queue.put((p_idx, s_idx, s, pcm16, pause_ms))
+            finally:
+                await queue.put(None)
+
+        producer_task = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                p_idx, s_idx, sentence, pcm16, pause_ms = item
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+
+                if pause_ms > 0:
+                    silence_samples = int(self.sample_rate * (pause_ms / 1000.0))
+                    silence_bytes = silence_samples * 2
+                    chunk = pcm16 + (b"\x00" * silence_bytes)
+                else:
+                    chunk = pcm16
+                yield (p_idx, s_idx, sentence, chunk)
         finally:
             producer_task.cancel()
             with contextlib.suppress(Exception):
