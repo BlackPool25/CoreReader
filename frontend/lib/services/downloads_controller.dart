@@ -347,7 +347,10 @@ class DownloadsController extends ChangeNotifier {
                 final text = (obj['text'] as String?) ?? '';
                 final p = (obj['paragraph_index'] as num?)?.toInt() ?? 0;
                 final s = (obj['sentence_index'] as num?)?.toInt() ?? 0;
-                final ms = ((bytesWritten / 2) / sampleRate * 1000).round();
+                // Prefer backend-provided ms_start (based on synthesized sample count).
+                // Fallback to bytesWritten only for backward compatibility.
+                final msStart = (obj['ms_start'] as num?)?.toInt();
+                final ms = msStart ?? ((bytesWritten / 2) / sampleRate * 1000).round();
                 timeline.add(ChapterTimelineItem(ms: ms, text: text, paragraphIndex: p, sentenceIndex: s));
 
                 // Progress is based on sentence count, not bytes.

@@ -265,6 +265,34 @@ Notes:
 - First startup downloads models; allow extra time for the first boot.
 - If you change regions/names, the registry/image/url will change—use the commands above to retrieve the exact values.
 
+## Deploy backend to Modal
+
+This workspace includes a ready-to-deploy Modal app definition in:
+
+- [CoreReader-modal/modal_app.py](../CoreReader-modal/modal_app.py)
+
+It deploys the same FastAPI backend (HTTP + WebSocket) with:
+- CPU-only Kokoro ONNX
+- Persistent model cache (Modal Volume) so downloads happen once
+- 3 CPU cores + 4 GiB RAM (easy to scale up later)
+
+Deploy:
+
+```bash
+cd ../CoreReader-modal
+modal deploy modal_app.py
+```
+
+Modal prints a public base URL like:
+
+- https://<user>--corereader-backend-fastapi-app.modal.run
+
+In the Flutter app Settings, set **WebSocket base URL** to:
+
+- wss://<user>--corereader-backend-fastapi-app.modal.run
+
+The app connects to `/ws` automatically.
+
 ## Local persistence (frontend)
 
 The app stores the following locally (SharedPreferences):

@@ -40,6 +40,11 @@ class NovelStreamController implements ReaderStreamController {
   SoundHandle? _handle;
   int? _streamSampleRate;
 
+  // Track how much PCM we have enqueued into the SoLoud buffer stream.
+  // We clamp highlight time against this to avoid highlight drift when the
+  // backend is slower than real-time (buffer underruns).
+  int _enqueuedSamples = 0;
+
   Timer? _noAudioTimer;
   bool _receivedAnyAudio = false;
 
@@ -61,6 +66,7 @@ class NovelStreamController implements ReaderStreamController {
   List<Map<String, dynamic>> _offlineTimeline = const [];
   int _offlineTimelineIdx = 0;
   int _offlineStartMs = 0;
+  int _offlineEnqueuedSamples = 0;
 
   bool _connected = false;
   @override
@@ -140,6 +146,9 @@ class NovelStreamController implements ReaderStreamController {
     _handle = handle;
     _streamSampleRate = sampleRate;
 
+    _enqueuedSamples = 0;
+    _offlineEnqueuedSamples = 0;
+
     // Reset live-queue state when we recreate the stream.
     _pendingSentenceMeta.clear();
     _receivedSentenceAudio.clear();
@@ -161,10 +170,16 @@ class NovelStreamController implements ReaderStreamController {
       if (_audioSource == null || _pendingLiveSentences.isEmpty) return;
       try {
         final consumed = _soloud.getStreamTimeConsumed(_audioSource!).inMilliseconds;
+        final sr = _streamSampleRate ?? 24000;
+        // Clamp to audio we have actually enqueued. Without this, when the
+        // backend/network stalls, SoLoud can run out of buffered audio and
+        // highlight events may advance ahead of audible speech.
+        final maxPlayableMs = ((_enqueuedSamples * 1000) / sr).floor();
+        final t = consumed <= maxPlayableMs ? consumed : maxPlayableMs;
         while (_pendingLiveSentences.isNotEmpty) {
           final evt = _pendingLiveSentences.first;
           final ms = (evt['ms_start'] as num?)?.toInt() ?? 0;
-          if (ms > consumed) break;
+          if (ms > t) break;
           _pendingLiveSentences.removeAt(0);
           _eventsController.add(evt);
 
@@ -202,6 +217,7 @@ class NovelStreamController implements ReaderStreamController {
         final aligned = _alignPcm16(chunk);
         if (aligned.isNotEmpty) {
           _soloud.addAudioDataStream(_audioSource!, aligned);
+          _enqueuedSamples += aligned.length ~/ 2;
         }
       } catch (_) {
         // ignore
@@ -439,7 +455,10 @@ class NovelStreamController implements ReaderStreamController {
       if (!_offlineActive || _audioSource == null) return;
       try {
         final consumed = _soloud.getStreamTimeConsumed(_audioSource!).inMilliseconds;
-        final t = consumed + _offlineStartMs;
+        final sr = _streamSampleRate ?? sampleRate;
+        final maxPlayableMs = _offlineStartMs + (((_offlineEnqueuedSamples * 1000) / sr).floor());
+        final rawT = consumed + _offlineStartMs;
+        final t = rawT <= maxPlayableMs ? rawT : maxPlayableMs;
         while (_offlineTimelineIdx < _offlineTimeline.length) {
           final item = _offlineTimeline[_offlineTimelineIdx];
           final ms = (item['ms'] as num?)?.toInt() ?? 0;
@@ -493,6 +512,7 @@ class NovelStreamController implements ReaderStreamController {
         final aligned = _alignPcm16(chunk);
         if (aligned.isNotEmpty) {
           _soloud.addAudioDataStream(_audioSource!, aligned);
+          _offlineEnqueuedSamples += aligned.length ~/ 2;
         }
 
         // Light pacing: prevents some devices/drivers from glitching when
@@ -626,6 +646,8 @@ class NovelStreamController implements ReaderStreamController {
     _handle = null;
     _audioSource = null;
     _streamSampleRate = null;
+    _enqueuedSamples = 0;
+    _offlineEnqueuedSamples = 0;
   }
 
   Uint8List _alignPcm16(Uint8List bytes) {

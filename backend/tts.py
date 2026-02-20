@@ -34,10 +34,38 @@ class TTSEngine:
         # CPU-only mode for maximum compatibility.
         self.providers = ["CPUExecutionProvider"]
 
+        # ONNX Runtime performance tuning (CPU).
+        # Keep defaults conservative; allow override via env for deployments.
+        sess_options = None
+        try:
+            sess_options = ort.SessionOptions()
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            # Thread counts: 0 means ORT will choose (often = physical cores).
+            intra = int(os.getenv("ORT_INTRA_OP_THREADS", "0") or "0")
+            inter = int(os.getenv("ORT_INTER_OP_THREADS", "1") or "1")
+            if intra >= 0:
+                sess_options.intra_op_num_threads = intra
+            if inter >= 0:
+                sess_options.inter_op_num_threads = inter
+            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            sess_options.add_session_config_entry("session.intra_op.allow_spinning", os.getenv("ORT_ALLOW_SPINNING", "1"))
+        except Exception:
+            sess_options = None
+
         # kokoro_onnx API varies by version; try passing providers if supported.
         kokoro_sig = inspect.signature(Kokoro)
+        kokoro_kwargs = {}
         if "providers" in kokoro_sig.parameters:
-            self.kokoro = Kokoro(self.model_path, self.voices_path, providers=self.providers)
+            kokoro_kwargs["providers"] = self.providers
+        # Newer versions may support passing ORT session options.
+        if sess_options is not None:
+            for k in ("sess_options", "session_options", "ort_session_options"):
+                if k in kokoro_sig.parameters:
+                    kokoro_kwargs[k] = sess_options
+                    break
+
+        if kokoro_kwargs:
+            self.kokoro = Kokoro(self.model_path, self.voices_path, **kokoro_kwargs)
         else:
             self.kokoro = Kokoro(self.model_path, self.voices_path)
 
