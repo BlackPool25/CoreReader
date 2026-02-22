@@ -74,18 +74,24 @@ class ChapterTimelineItem {
     required this.text,
     required this.paragraphIndex,
     required this.sentenceIndex,
+    this.charStart,
+    this.charEnd,
   });
 
   final int ms;
   final String text;
   final int paragraphIndex;
   final int sentenceIndex;
+  final int? charStart;
+  final int? charEnd;
 
   Map<String, dynamic> toJson() => {
         'ms': ms,
         'text': text,
         'p': paragraphIndex,
         's': sentenceIndex,
+      if (charStart != null) 'cs': charStart,
+      if (charEnd != null) 'ce': charEnd,
       };
 
   static ChapterTimelineItem fromJson(Map<String, dynamic> json) {
@@ -94,6 +100,8 @@ class ChapterTimelineItem {
       text: (json['text'] as String?) ?? '',
       paragraphIndex: (json['p'] as num?)?.toInt() ?? 0,
       sentenceIndex: (json['s'] as num?)?.toInt() ?? 0,
+      charStart: (json['cs'] as num?)?.toInt(),
+      charEnd: (json['ce'] as num?)?.toInt(),
     );
   }
 }

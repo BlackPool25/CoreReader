@@ -142,6 +142,56 @@ class TTSEngine:
         sentences = re.split(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s+", text)
         return [s.strip() for s in sentences if s and s.strip()]
 
+    def split_sentences_with_offsets(self, text: str) -> List[tuple[str, int, int]]:
+        """Split `text` into sentences and return (sentence, char_start, char_end).
+
+        Offsets are relative to the provided `text` (typically a paragraph).
+        The returned span is trimmed for leading/trailing whitespace so clients
+        can highlight the exact sentence substring without `indexOf`.
+        """
+        if not text:
+            return []
+
+        # Match the whitespace boundary *after* sentence punctuation.
+        boundary = re.compile(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s+")
+        out: List[tuple[str, int, int]] = []
+        start = 0
+        for m in boundary.finditer(text):
+            end = m.start()
+            if end <= start:
+                start = m.end()
+                continue
+            seg_start, seg_end = start, end
+            # Trim whitespace within the segment and adjust offsets.
+            while seg_start < seg_end and text[seg_start].isspace():
+                seg_start += 1
+            while seg_end > seg_start and text[seg_end - 1].isspace():
+                seg_end -= 1
+            if seg_end > seg_start:
+                out.append((text[seg_start:seg_end], seg_start, seg_end))
+            start = m.end()
+
+        # Tail segment.
+        if start < len(text):
+            seg_start, seg_end = start, len(text)
+            while seg_start < seg_end and text[seg_start].isspace():
+                seg_start += 1
+            while seg_end > seg_start and text[seg_end - 1].isspace():
+                seg_end -= 1
+            if seg_end > seg_start:
+                out.append((text[seg_start:seg_end], seg_start, seg_end))
+
+        # Fallback: if boundary regex didn't match but text has content.
+        if not out:
+            seg_start, seg_end = 0, len(text)
+            while seg_start < seg_end and text[seg_start].isspace():
+                seg_start += 1
+            while seg_end > seg_start and text[seg_end - 1].isspace():
+                seg_end -= 1
+            if seg_end > seg_start:
+                out.append((text[seg_start:seg_end], seg_start, seg_end))
+        return out
+
     def split_paragraphs(self, paragraphs: List[str]) -> List[tuple[int, int, str, bool]]:
         """Flatten paragraphs into (paragraph_index, sentence_index, sentence_text, is_last_in_paragraph)."""
         out: List[tuple[int, int, str, bool]] = []
@@ -154,6 +204,31 @@ class TTSEngine:
                 sentences = [p]
             for s_idx, s in enumerate(sentences):
                 out.append((p_idx, s_idx, s, s_idx == (len(sentences) - 1)))
+        return out
+
+    def split_paragraphs_with_offsets(self, paragraphs: List[str]) -> List[tuple[int, int, str, bool, int, int]]:
+        """Flatten paragraphs into (p_idx, s_idx, sentence, is_last, char_start, char_end)."""
+        out: List[tuple[int, int, str, bool, int, int]] = []
+        for p_idx, raw in enumerate(paragraphs):
+            p = raw or ""
+            if not p.strip():
+                continue
+            parts = self.split_sentences_with_offsets(p)
+            if not parts:
+                # Whole paragraph as one sentence.
+                seg = p
+                # Trim offsets to first/last non-space.
+                seg_start, seg_end = 0, len(seg)
+                while seg_start < seg_end and seg[seg_start].isspace():
+                    seg_start += 1
+                while seg_end > seg_start and seg[seg_end - 1].isspace():
+                    seg_end -= 1
+                if seg_end > seg_start:
+                    out.append((p_idx, 0, seg[seg_start:seg_end], True, seg_start, seg_end))
+                continue
+
+            for s_idx, (s, cs, ce) in enumerate(parts):
+                out.append((p_idx, s_idx, s, s_idx == (len(parts) - 1), cs, ce))
         return out
 
     def _iter_pcm_frames(self, pcm16: bytes, frame_bytes: int) -> Iterable[bytes]:
@@ -341,7 +416,7 @@ class TTSEngine:
         pause_question_ms: int = 260,
         pause_paragraph_extra_ms: int = 240,
         fade_ms: int = 6,
-    ) -> AsyncIterator[tuple[int, int, str, bytes]]:
+    ) -> AsyncIterator[tuple[int, int, str, bytes, int, int]]:
         """Yield sentence-atomic PCM chunks.
 
         Returns (paragraph_index, sentence_index, sentence_text, pcm16_bytes).
@@ -353,8 +428,8 @@ class TTSEngine:
         between sentences (at the end of the current chunk), not mid-sentence.
         """
 
-        segments = self.split_paragraphs(paragraphs)
-        queue: asyncio.Queue[Optional[tuple[int, int, str, bytes, int]]] = asyncio.Queue(
+        segments = self.split_paragraphs_with_offsets(paragraphs)
+        queue: asyncio.Queue[Optional[tuple[int, int, str, bytes, int, int, int]]] = asyncio.Queue(
             maxsize=max(1, prefetch_sentences)
         )
 
@@ -373,7 +448,7 @@ class TTSEngine:
 
         async def producer() -> None:
             try:
-                for p_idx, s_idx, s, is_last in segments:
+                for p_idx, s_idx, s, is_last, cs, ce in segments:
                     if cancel_event is not None and cancel_event.is_set():
                         break
                     if not s:
@@ -382,7 +457,7 @@ class TTSEngine:
                     if fade_ms and fade_ms > 0:
                         pcm16 = self._apply_edge_fade_pcm16(pcm16, fade_ms=int(fade_ms))
                     pause_ms = pause_ms_for(s, is_last)
-                    await queue.put((p_idx, s_idx, s, pcm16, pause_ms))
+                    await queue.put((p_idx, s_idx, s, pcm16, pause_ms, int(cs), int(ce)))
             finally:
                 await queue.put(None)
 
@@ -392,7 +467,7 @@ class TTSEngine:
                 item = await queue.get()
                 if item is None:
                     break
-                p_idx, s_idx, sentence, pcm16, pause_ms = item
+                p_idx, s_idx, sentence, pcm16, pause_ms, cs, ce = item
                 if cancel_event is not None and cancel_event.is_set():
                     return
 
@@ -402,7 +477,7 @@ class TTSEngine:
                     chunk = pcm16 + (b"\x00" * silence_bytes)
                 else:
                     chunk = pcm16
-                yield (p_idx, s_idx, sentence, chunk)
+                yield (p_idx, s_idx, sentence, chunk, cs, ce)
         finally:
             producer_task.cancel()
             with contextlib.suppress(Exception):

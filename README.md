@@ -193,6 +193,9 @@ This repo also includes the required `flutter_soloud` Web bootstrap scripts in `
 - Frontend opens `WS /ws` and sends `{ "command": "play", "url": <chapter_url>, "voice": <id>, "speed": <x>, "start_paragraph": <idx> }`.
 - Backend scrapes the chapter, emits a `chapter_info` JSON message (paragraphs + audio format), then streams PCM16 audio **sentence chunks**.
 - Backend emits `sentence` JSON messages for highlighting, including `paragraph_index` and `sentence_index`.
+- Sentence events also include:
+  - `char_start` / `char_end` (character offsets within the paragraph) so the client can highlight by range (avoids fragile string matching)
+  - `chunk_bytes` / `chunk_samples` (size of the upcoming sentence PCM chunk) so the client can reliably pair sentence metadata with audio
 - Frontend can send `{ "command": "pause" }`, `{ "command": "resume" }`, `{ "command": "stop" }` during playback.
 
 ### Streaming vs downloads (important)

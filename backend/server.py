@@ -303,7 +303,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             elif cmd == "stop":
                                 cancel_event.set()
 
-                        async for p_idx, s_idx, sentence, audio_chunk in app.state.tts.generate_audio_stream_paragraphs_sentence_chunks(
+                        async for p_idx, s_idx, sentence, audio_chunk, cs, ce in app.state.tts.generate_audio_stream_paragraphs_sentence_chunks(
                             paragraphs_slice,
                             voice=voice,
                             speed=speed,
@@ -348,6 +348,12 @@ async def websocket_endpoint(websocket: WebSocket):
                                         "paragraph_index": int(p_idx + start_paragraph),
                                         "sentence_index": int(s_idx),
                                         "ms_start": ms_start,
+                                        "char_start": int(cs),
+                                        "char_end": int(ce),
+                                        # Size of the *next* binary message for this sentence in samples/bytes.
+                                        # Helps clients associate metadata with audio even if transport splits chunks.
+                                        "chunk_samples": int(len(audio_chunk) // 2),
+                                        "chunk_bytes": int(len(audio_chunk)),
                                     }
                                 )
                             await websocket.send_bytes(audio_chunk)

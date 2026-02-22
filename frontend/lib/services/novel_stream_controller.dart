@@ -25,6 +25,28 @@ class ChapterInfo {
   final int sampleRate;
 }
 
+class _LiveSentenceChunk {
+  _LiveSentenceChunk({required this.pcm, required this.event});
+
+  /// PCM16 mono bytes (must be 2-byte aligned).
+  final Uint8List pcm;
+
+  /// The sentence JSON event associated with this PCM chunk (may be null if the
+  /// backend sent audio without a preceding sentence event).
+  final Map<String, dynamic>? event;
+}
+
+class _ScheduledSentence {
+  _ScheduledSentence({required this.startSample, required this.event});
+
+  /// Absolute sample index from the start of the stream at which this sentence
+  /// chunk begins.
+  final int startSample;
+
+  /// The event to emit on the public events stream.
+  final Map<String, dynamic> event;
+}
+
 class NovelStreamController implements ReaderStreamController {
   final _eventsController = StreamController<Map<String, dynamic>>.broadcast();
   @override
@@ -50,14 +72,22 @@ class NovelStreamController implements ReaderStreamController {
 
   int? _pcmCarryByte;
 
+  // If the backend provides chunk sizing, we can assemble a full sentence chunk
+  // even if the PCM arrives split across multiple binary messages.
+  final BytesBuilder _partialSentencePcm = BytesBuilder(copy: false);
+
   // Live stream sentence-audio queue.
   final _pendingSentenceMeta = <Map<String, dynamic>>[];
-  final _receivedSentenceAudio = <Uint8List>[];
+  final _receivedSentenceAudio = <_LiveSentenceChunk>[];
   Timer? _chunkPumpTimer;
   bool _remoteChapterComplete = false;
   int _playedSentenceCount = 0;
   int _enqueuedSentenceCount = 0;
   static const int _targetSentenceLookahead = 3;
+
+  // Highlight schedule for live streaming, keyed off exact enqueued sample boundaries.
+  final _scheduledLiveSentences = <_ScheduledSentence>[];
+  Timer? _liveTimelineTimer;
 
   // Offline playback state.
   Timer? _offlineTimelineTimer;
@@ -152,6 +182,7 @@ class NovelStreamController implements ReaderStreamController {
     // Reset live-queue state when we recreate the stream.
     _pendingSentenceMeta.clear();
     _receivedSentenceAudio.clear();
+    _partialSentencePcm.clear();
     _remoteChapterComplete = false;
     _playedSentenceCount = 0;
     _enqueuedSentenceCount = 0;
@@ -159,48 +190,40 @@ class NovelStreamController implements ReaderStreamController {
     _chunkPumpTimer = null;
   }
 
-  // Pending sentence events from live stream, to be fired based on playback position.
-  final _pendingLiveSentences = <Map<String, dynamic>>[];
-  Timer? _liveTimelineTimer;
-
   void _startLiveTimeline() {
     _liveTimelineTimer?.cancel();
-    _liveTimelineTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
-      if (_audioSource == null || _pendingLiveSentences.isEmpty) return;
+    _liveTimelineTimer = Timer.periodic(const Duration(milliseconds: 40), (_) {
+      if (_audioSource == null || _scheduledLiveSentences.isEmpty) return;
       try {
-        final consumed = _soloud.getStreamTimeConsumed(_audioSource!).inMilliseconds;
+        final src = _audioSource!;
         final sr = _streamSampleRate ?? 24000;
-        // Clamp to audio we have actually enqueued. Without this, when the
-        // backend/network stalls, SoLoud can run out of buffered audio and
-        // highlight events may advance ahead of audible speech.
-        final maxPlayableMs = ((_enqueuedSamples * 1000) / sr).floor();
-        final t = consumed <= maxPlayableMs ? consumed : maxPlayableMs;
-        while (_pendingLiveSentences.isNotEmpty) {
-          // Do not advance sentence highlights unless we have enqueued the
-          // corresponding sentence audio chunk. On slow backends/networks,
-          // JSON sentence events can arrive ahead of the binary PCM chunk.
-          if ((_playedSentenceCount + 1) > _enqueuedSentenceCount) break;
 
-          final evt = _pendingLiveSentences.first;
-          final ms = (evt['ms_start'] as num?)?.toInt() ?? 0;
-          if (ms > t) break;
-          _pendingLiveSentences.removeAt(0);
-          _eventsController.add(evt);
+        // Prefer microseconds to reduce rounding drift.
+        final consumedUs = _soloud.getStreamTimeConsumed(src).inMicroseconds;
+        var consumedSamples = ((consumedUs * sr) / 1000000.0).floor();
+        if (consumedSamples < 0) consumedSamples = 0;
 
-          // Update played-sentence count (used to keep a small lookahead queue).
-          if (evt['type'] == 'sentence') {
-            _playedSentenceCount++;
-            _pumpSentenceAudio();
-          }
+        // Clamp to what we have actually enqueued.
+        if (consumedSamples > _enqueuedSamples) consumedSamples = _enqueuedSamples;
+
+        while (_scheduledLiveSentences.isNotEmpty) {
+          final next = _scheduledLiveSentences.first;
+          if (next.startSample > consumedSamples) break;
+          _scheduledLiveSentences.removeAt(0);
+          _eventsController.add(next.event);
+          _playedSentenceCount++;
+          _pumpSentenceAudio();
         }
-      } catch (_) {}
+      } catch (_) {
+        // ignore
+      }
     });
   }
 
   void _stopLiveTimeline() {
     _liveTimelineTimer?.cancel();
     _liveTimelineTimer = null;
-    _pendingLiveSentences.clear();
+    _scheduledLiveSentences.clear();
 
     _chunkPumpTimer?.cancel();
     _chunkPumpTimer = null;
@@ -216,12 +239,21 @@ class NovelStreamController implements ReaderStreamController {
 
     // Enqueue enough audio to maintain a small sentence lookahead.
     while (_receivedSentenceAudio.isNotEmpty && (_enqueuedSentenceCount - _playedSentenceCount) < _targetSentenceLookahead) {
-      final chunk = _receivedSentenceAudio.removeAt(0);
+      final item = _receivedSentenceAudio.removeAt(0);
       try {
-        final aligned = _alignPcm16(chunk);
+        final aligned = item.pcm;
         if (aligned.isNotEmpty) {
+          final startSample = _enqueuedSamples;
           _soloud.addAudioDataStream(_audioSource!, aligned);
           _enqueuedSamples += aligned.length ~/ 2;
+
+          // Schedule the sentence highlight exactly at the point this chunk
+          // begins playing (sample-accurate with respect to what we actually
+          // enqueued into SoLoud).
+          final evt = item.event;
+          if (evt != null) {
+            _scheduledLiveSentences.add(_ScheduledSentence(startSample: startSample, event: evt));
+          }
         }
       } catch (_) {
         // ignore
@@ -281,18 +313,11 @@ class NovelStreamController implements ReaderStreamController {
         if (event is String) {
           final obj = jsonDecode(event);
           if (obj is Map<String, dynamic>) {
-            // Sentence events with ms_start are queued and fired by the live
-            // timeline timer so highlights match actual playback position.
             if (obj['type'] == 'sentence') {
-              if (obj.containsKey('ms_start')) {
-                _pendingLiveSentences.add(obj);
-
-                // Keep a parallel queue so we can associate the next binary chunk
-                // with this sentence.
-                _pendingSentenceMeta.add(obj);
-              } else {
-                _eventsController.add(obj);
-              }
+              // Queue sentence metadata so the next binary chunk can be paired
+              // with it, ensuring highlights are driven by the actual PCM
+              // chunk that gets enqueued.
+              _pendingSentenceMeta.add(obj);
               return;
             }
             _eventsController.add(obj);
@@ -331,12 +356,42 @@ class NovelStreamController implements ReaderStreamController {
         }
         if (_audioSource != null) {
           try {
-            // Backend sends one binary message per sentence chunk.
-            // Associate it with the oldest pending sentence meta (best-effort).
+            // Pair PCM with sentence meta. Prefer assembling based on backend-provided
+            // chunk_bytes/chunk_samples so we don't assume 1 WS binary message == 1 sentence.
+
             if (_pendingSentenceMeta.isNotEmpty) {
-              _pendingSentenceMeta.removeAt(0);
+              final peek = _pendingSentenceMeta.first;
+              final expectedBytes = (peek['chunk_bytes'] as num?)?.toInt() ?? 0;
+
+              if (expectedBytes > 0) {
+                _partialSentencePcm.add(bytes);
+                if (_partialSentencePcm.length >= expectedBytes) {
+                  final meta = _pendingSentenceMeta.removeAt(0);
+                  final full = _partialSentencePcm.takeBytes();
+
+                  // If we received more than expected, carry remainder forward.
+                  if (full.length > expectedBytes) {
+                    final used = full.sublist(0, expectedBytes);
+                    final rem = full.sublist(expectedBytes);
+                    if (rem.isNotEmpty) _partialSentencePcm.add(rem);
+                    final aligned = _alignPcm16(Uint8List.fromList(used));
+                    _receivedSentenceAudio.add(_LiveSentenceChunk(pcm: aligned, event: meta));
+                  } else {
+                    final aligned = _alignPcm16(Uint8List.fromList(full));
+                    _receivedSentenceAudio.add(_LiveSentenceChunk(pcm: aligned, event: meta));
+                  }
+                }
+              } else {
+                // Legacy: assume each binary event is one sentence chunk.
+                final meta = _pendingSentenceMeta.removeAt(0);
+                final aligned = _alignPcm16(bytes);
+                _receivedSentenceAudio.add(_LiveSentenceChunk(pcm: aligned, event: meta));
+              }
+            } else {
+              // Audio without sentence meta (best-effort): still enqueue.
+              final aligned = _alignPcm16(bytes);
+              _receivedSentenceAudio.add(_LiveSentenceChunk(pcm: aligned, event: null));
             }
-            _receivedSentenceAudio.add(bytes);
 
             // Start a small pump to keep lookahead filled, without dumping all
             // received data into the buffer at once.
@@ -473,6 +528,8 @@ class NovelStreamController implements ReaderStreamController {
             'text': (item['text'] as String?) ?? '',
             'paragraph_index': (item['p'] as num?)?.toInt() ?? 0,
             'sentence_index': (item['s'] as num?)?.toInt() ?? 0,
+            if (item['cs'] != null) 'char_start': (item['cs'] as num?)?.toInt() ?? 0,
+            if (item['ce'] != null) 'char_end': (item['ce'] as num?)?.toInt() ?? 0,
           });
         }
       } catch (_) {
@@ -599,8 +656,10 @@ class NovelStreamController implements ReaderStreamController {
   @override
   Future<void> stop() async {
     _pcmCarryByte = null;
+    _partialSentencePcm.clear();
     _pendingSentenceMeta.clear();
     _receivedSentenceAudio.clear();
+    _scheduledLiveSentences.clear();
     _remoteChapterComplete = false;
     _playedSentenceCount = 0;
     _enqueuedSentenceCount = 0;

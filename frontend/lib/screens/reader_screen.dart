@@ -47,6 +47,8 @@ class ReaderScreenState extends State<ReaderScreen> {
   String? _nextUrl;
   String? _prevUrl;
   String _sentence = '';
+  int? _sentenceCharStart;
+  int? _sentenceCharEnd;
   List<String> _paragraphs = const [];
   int _currentParagraphIndex = -1;
 
@@ -133,6 +135,8 @@ class ReaderScreenState extends State<ReaderScreen> {
         _nextUrl = e['next_url'] as String?;
         _prevUrl = e['prev_url'] as String?;
         _sentence = '';
+        _sentenceCharStart = null;
+        _sentenceCharEnd = null;
         _paragraphs = paras;
         _paraKeys = List.generate(paras.length, (_) => GlobalKey());
         _currentParagraphIndex = -1;
@@ -145,14 +149,20 @@ class ReaderScreenState extends State<ReaderScreen> {
       final s = (e['text'] as String?) ?? '';
 
       final pIdx = (e['paragraph_index'] as num?)?.toInt();
+      final cs = (e['char_start'] as num?)?.toInt();
+      final ce = (e['char_end'] as num?)?.toInt();
 
       final token = ++_sentenceToken;
-      final delayMs = _playingOffline ? 0 : AppSettingsScope.of(context).highlightDelayMs;
+      // Highlights are already scheduled by the stream controller based on
+      // actual audio playback position; adding extra UI delay introduces drift.
+      const delayMs = 0;
       Future<void>.delayed(Duration(milliseconds: delayMs), () {
         if (!mounted) return;
         if (token != _sentenceToken) return;
         setState(() {
           _sentence = s;
+          _sentenceCharStart = cs;
+          _sentenceCharEnd = ce;
           if (pIdx != null) _currentParagraphIndex = pIdx;
         });
         if (_autoScroll && _currentParagraphIndex >= 0 && _currentParagraphIndex < _paraKeys.length) {
@@ -484,7 +494,13 @@ class ReaderScreenState extends State<ReaderScreen> {
                         child: GestureDetector(
                           behavior: HitTestBehavior.opaque,
                           onTap: () => unawaited(_playChapter(_chapter, startParagraph: i)),
-                          child: HighlightInParagraph(paragraph: p, highlight: _sentence, fontSize: _fontSize),
+                          child: HighlightInParagraph(
+                            paragraph: p,
+                            highlight: (i == _currentParagraphIndex) ? _sentence : '',
+                            highlightStart: (i == _currentParagraphIndex) ? _sentenceCharStart : null,
+                            highlightEnd: (i == _currentParagraphIndex) ? _sentenceCharEnd : null,
+                            fontSize: _fontSize,
+                          ),
                         ),
                       );
                     }),
