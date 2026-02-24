@@ -384,17 +384,26 @@ async def websocket_endpoint(websocket: WebSocket):
                         )
                     except Exception as e:
                         logger.error(f"Play stream error: {e}")
-                        await websocket.send_json({"type": "error", "message": str(e)})
+                        try:
+                            await websocket.send_json({"type": "error", "message": str(e)})
+                        except Exception:
+                            pass  # Client already disconnected
                 
                 else:
                     await websocket.send_json({"error": "Unknown command"})
             
             except json.JSONDecodeError:
-                await websocket.send_json({"error": "Invalid JSON"})
+                try:
+                    await websocket.send_json({"error": "Invalid JSON"})
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
                 traceback.print_exc()
-                await websocket.send_json({"error": "Internal server error"})
+                try:
+                    await websocket.send_json({"error": "Internal server error"})
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")

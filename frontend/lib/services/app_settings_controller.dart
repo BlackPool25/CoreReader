@@ -25,6 +25,7 @@ class AppSettingsController extends ChangeNotifier {
   double _fontSize = 16.0;
   String? _defaultVoice;
   double _defaultSpeed = 0.9;
+  double _defaultPlaybackMultiplier = 1.0;
   int _libraryGridColumns = 2;
   int _libraryGridRows = 2;
 
@@ -41,7 +42,10 @@ class AppSettingsController extends ChangeNotifier {
   List<String> get serverBaseUrls => _serverBaseUrls;
   double get fontSize => _fontSize;
   String? get defaultVoice => _defaultVoice;
+  /// TTS render speed sent to Kokoro (baked into PCM at synthesis time).
   double get defaultSpeed => _defaultSpeed;
+  /// SoLoud fast-forward multiplier applied at playback time (does not affect PCM).
+  double get defaultPlaybackMultiplier => _defaultPlaybackMultiplier;
   int get libraryGridColumns => _libraryGridColumns;
   int get libraryGridRows => _libraryGridRows;
 
@@ -60,6 +64,7 @@ class AppSettingsController extends ChangeNotifier {
     _fontSize = await SettingsStore.getReaderFontSize();
     _defaultVoice = await SettingsStore.getDefaultVoice();
     _defaultSpeed = await SettingsStore.getDefaultSpeed();
+    _defaultPlaybackMultiplier = await SettingsStore.getDefaultPlaybackMultiplier();
     _libraryGridColumns = await SettingsStore.getLibraryGridColumns();
     _libraryGridRows = await SettingsStore.getLibraryGridRows();
 
@@ -124,6 +129,14 @@ class AppSettingsController extends ChangeNotifier {
     _defaultSpeed = clamped;
     notifyListeners();
     await SettingsStore.setDefaultSpeed(clamped);
+  }
+
+  Future<void> setDefaultPlaybackMultiplier(double speed) async {
+    final clamped = speed.clamp(0.5, 3.0).toDouble();
+    if ((_defaultPlaybackMultiplier - clamped).abs() < 0.0001) return;
+    _defaultPlaybackMultiplier = clamped;
+    notifyListeners();
+    await SettingsStore.setDefaultPlaybackMultiplier(clamped);
   }
 
   Future<void> setLibraryGridColumns(int columns) async {

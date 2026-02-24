@@ -354,8 +354,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
               Slider(
                 value: _highlightDelayMs.toDouble(),
                 min: 0,
-                max: 2000,
-                divisions: 40,
+                max: 5000,
+                divisions: 50,
                 label: '${_highlightDelayMs}ms',
                 onChanged: (v) => setState(() => _highlightDelayMs = v.round()),
               ),
@@ -372,13 +372,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 decoration: const InputDecoration(border: OutlineInputBorder()),
               ),
               const SizedBox(height: 12),
-              Text('Default speed: ${_defaultSpeed.toStringAsFixed(2)}x'),
+              Text(
+                'TTS Render Speed: ${_defaultSpeed.toStringAsFixed(2)}×',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              Text(
+                'Controls how fast Kokoro speaks. Baked into synthesised audio. '
+                'Use "Playback Speed" in the Reader for instant fast-forward.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
               Slider(
                 value: _defaultSpeed,
-                min: 0.7,
-                max: 1.4,
-                divisions: 28,
-                label: '${_defaultSpeed.toStringAsFixed(2)}x',
+                min: 0.5,
+                max: 2.0,
+                divisions: 30,
+                label: '${_defaultSpeed.toStringAsFixed(2)}×',
                 onChanged: (v) => setState(() => _defaultSpeed = v),
               ),
               const SizedBox(height: 12),

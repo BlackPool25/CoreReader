@@ -40,7 +40,16 @@ class ReaderScreenState extends State<ReaderScreen> {
 
   List<String> _voices = const ['af_bella'];
   String? _sessionVoice;
-  double? _sessionSpeed;
+
+  /// TTS render speed: the tempo Kokoro generates audio at. Sent to the
+  /// backend as the `speed` field. Changing this requires re-synthesis
+  /// (restarts the WebSocket stream for live chapters).
+  double? _sessionTtsSpeed;
+
+  /// Reader playback multiplier: applied to SoLoud via setRelativePlaySpeed.
+  /// Instant fast-forward — no re-synthesis, no stream restart.
+  /// Works identically for both live-streamed and downloaded chapters.
+  double _playbackMultiplier = 1.0;
 
   String? _title;
   String? _chapterUrl;
@@ -53,6 +62,8 @@ class ReaderScreenState extends State<ReaderScreen> {
   int _currentParagraphIndex = -1;
 
   bool _playingOffline = false;
+  /// Baked TTS speed of the currently playing downloaded chapter (read-only display).
+  double? _offlineBakedTtsSpeed;
   int _sentenceToken = 0;
 
   bool _showNowReading = false;
@@ -100,14 +111,14 @@ class ReaderScreenState extends State<ReaderScreen> {
     final settings = AppSettingsScope.of(context);
     _fontSize = settings.fontSize;
     _sessionVoice = settings.defaultVoice;
-    _sessionSpeed = settings.defaultSpeed;
+    _sessionTtsSpeed = settings.defaultSpeed;
+    _playbackMultiplier = settings.defaultPlaybackMultiplier;
     _showNowReading = settings.showNowReading;
     _autoScroll = settings.readerAutoScroll;
 
     unawaited(_loadVoices());
 
     if (!kIsWeb) {
-      // Auto-start on mobile/desktop. Web often requires a user gesture.
       unawaited(_playChapter(_chapter, startParagraph: widget.startParagraph));
     }
   }
@@ -153,10 +164,9 @@ class ReaderScreenState extends State<ReaderScreen> {
       final ce = (e['char_end'] as num?)?.toInt();
 
       final token = ++_sentenceToken;
-      // Highlights are already scheduled by the stream controller based on
-      // actual audio playback position; adding extra UI delay introduces drift.
-      const delayMs = 0;
-      Future<void>.delayed(Duration(milliseconds: delayMs), () {
+      // Highlights are scheduled by the stream controller based on the exact
+      // SoLoud consumed-sample position. No additional delay is applied here.
+      Future<void>.delayed(Duration.zero, () {
         if (!mounted) return;
         if (token != _sentenceToken) return;
         setState(() {
@@ -182,7 +192,6 @@ class ReaderScreenState extends State<ReaderScreen> {
         }
       });
 
-      // Persist progress (paragraph-level resume is sufficient).
       final library = LibraryScope.of(context);
       unawaited(
         library.setProgress(
@@ -207,6 +216,7 @@ class ReaderScreenState extends State<ReaderScreen> {
         _prevUrl = e['prev_url'] as String?;
         _busy = false;
         _playingOffline = false;
+        _offlineBakedTtsSpeed = null;
       });
 
       final library = LibraryScope.of(context);
@@ -258,7 +268,9 @@ class ReaderScreenState extends State<ReaderScreen> {
   }
 
   String get _effectiveVoice => _sessionVoice ?? (_voices.isNotEmpty ? _voices.first : 'af_bella');
-  double get _effectiveSpeed => (_sessionSpeed ?? AppSettingsScope.of(context).defaultSpeed);
+
+  /// TTS render speed sent to Kokoro (baked into the synthesised PCM).
+  double get _effectiveTtsSpeed => (_sessionTtsSpeed ?? AppSettingsScope.of(context).defaultSpeed);
 
   Future<void> _playChapter(StoredChapter chapter, {int startParagraph = 0}) async {
     setState(() {
@@ -279,12 +291,17 @@ class ReaderScreenState extends State<ReaderScreen> {
         _playingOffline = false;
         throw Exception('Downloaded metadata missing');
       }
+      // Expose the baked TTS speed so the session sheet can show it read-only.
+      setState(() => _offlineBakedTtsSpeed = meta.ttsSpeed);
       await _stream.primeAudio(sampleRate: meta.sampleRate);
       await _stream.playDownloaded(
         treeUri: treeUri,
         pcmPath: downloaded.pcmPath,
         metaJson: meta.toJson(),
-        playbackSpeed: _effectiveSpeed,
+        // Pass current playback multiplier (fast-forward rate).
+        // The TTS render speed is already baked; playback multiplier is applied
+        // by the stream controller via setRelativePlaySpeed.
+        playbackSpeed: _playbackMultiplier,
         startParagraph: max(0, startParagraph),
       );
       setState(() => _busy = false);
@@ -294,14 +311,20 @@ class ReaderScreenState extends State<ReaderScreen> {
 
     // Streaming playback.
     _playingOffline = false;
+    _offlineBakedTtsSpeed = null;
     await _stream.primeAudio();
     await _stream.connectAndPlay(
       url: chapter.url,
       voice: _effectiveVoice,
-      speed: _effectiveSpeed,
+      // Send TTS render speed to Kokoro via the backend.
+      speed: _effectiveTtsSpeed,
       prefetch: _ttsPrefetchSentences,
       startParagraph: max(0, startParagraph),
     );
+    // Apply the playback multiplier to the live stream immediately after start.
+    if ((_playbackMultiplier - 1.0).abs() > 0.001) {
+      await _stream.setPlaybackSpeed(_playbackMultiplier);
+    }
 
     unawaited(_manageAutoDownloads());
   }
@@ -321,9 +344,10 @@ class ReaderScreenState extends State<ReaderScreen> {
     final ahead = settings.downloadsPrefetchAhead;
     final behind = settings.downloadsKeepBehind;
     final voice = _effectiveVoice;
-    final speed = settings.defaultSpeed;
+    // Use session TTS render speed for auto-downloads so the downloaded PCM
+    // matches what the user is currently hearing for live chapters.
+    final ttsSpeed = _effectiveTtsSpeed;
 
-    // Queue ahead.
     for (var i = 1; i <= ahead; i++) {
       final n = _chapter.n + i;
       final next = chapters.firstWhere(
@@ -341,7 +365,7 @@ class ReaderScreenState extends State<ReaderScreen> {
               chapterN: next.n,
               chapterUrl: next.url,
               voice: voice,
-              speed: speed,
+              speed: ttsSpeed,
               source: 'auto',
             );
           } catch (_) {}
@@ -349,7 +373,6 @@ class ReaderScreenState extends State<ReaderScreen> {
       );
     }
 
-    // Auto-delete behind (only chapters that were auto-downloaded).
     final minKeep = _chapter.n - behind;
     if (minKeep <= 1) return;
     final toDelete = downloads
@@ -419,26 +442,44 @@ class ReaderScreenState extends State<ReaderScreen> {
                   return _SessionSettingsSheet(
                     voices: _voices,
                     voice: _effectiveVoice,
-                    speed: _effectiveSpeed,
+                    ttsSpeed: _effectiveTtsSpeed,
+                    playbackMultiplier: _playbackMultiplier,
                     fontSize: _fontSize,
                     showNowReading: _showNowReading,
                     autoScroll: _autoScroll,
+                    // Offline chapters have a baked TTS speed; the slider is read-only.
+                    offlineBakedTtsSpeed: _offlineBakedTtsSpeed,
                   );
                 },
               );
               if (result == null) return;
+
+              final ttsSpeedChanged = (result.ttsSpeed - _effectiveTtsSpeed).abs() > 0.001;
+              final voiceChanged = result.voice != _effectiveVoice;
+              final multiplierChanged = (result.playbackMultiplier - _playbackMultiplier).abs() > 0.001;
+
               setState(() {
                 _sessionVoice = result.voice;
-                _sessionSpeed = result.speed;
+                _sessionTtsSpeed = result.ttsSpeed;
+                _playbackMultiplier = result.playbackMultiplier;
                 _showNowReading = result.showNowReading;
                 _autoScroll = result.autoScroll;
               });
+
               if (_stream.active) {
                 if (_playingOffline) {
-                  // Speed is baked into the downloaded PCM; a re-download is
-                  // needed for a different speed. No-op here.
+                  // TTS speed is baked; only apply the playback multiplier change.
+                  if (multiplierChanged) {
+                    await _stream.setPlaybackSpeed(_playbackMultiplier);
+                  }
                 } else {
-                  await _restartFromCurrentParagraph();
+                  if (ttsSpeedChanged || voiceChanged) {
+                    // Re-synthesis needed: restart from current paragraph.
+                    await _restartFromCurrentParagraph();
+                  } else if (multiplierChanged) {
+                    // Just update SoLoud speed — no restart, no gap.
+                    await _stream.setPlaybackSpeed(_playbackMultiplier);
+                  }
                 }
               }
             },
@@ -548,7 +589,6 @@ class ReaderScreenState extends State<ReaderScreen> {
                             }
                             final u = _prevUrl;
                             if (u != null && u.isNotEmpty) {
-                              // Fallback: unknown chapter number; try mapping by url.
                               final mapped = chapters.firstWhere(
                                 (c) => c.url == u,
                                 orElse: () => StoredChapter(n: 0, title: '', url: ''),
@@ -607,36 +647,58 @@ class ReaderScreenState extends State<ReaderScreen> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Session settings data class
+// ---------------------------------------------------------------------------
+
 class _SessionSettings {
   _SessionSettings({
     required this.voice,
-    required this.speed,
+    required this.ttsSpeed,
+    required this.playbackMultiplier,
     required this.showNowReading,
     required this.autoScroll,
   });
 
   final String voice;
-  final double speed;
+
+  /// TTS render speed — sent to Kokoro (baked into PCM).
+  final double ttsSpeed;
+
+  /// Playback multiplier — applied to SoLoud (instant fast-forward).
+  final double playbackMultiplier;
+
   final bool showNowReading;
   final bool autoScroll;
 }
+
+// ---------------------------------------------------------------------------
+// Session settings sheet
+// ---------------------------------------------------------------------------
 
 class _SessionSettingsSheet extends StatefulWidget {
   const _SessionSettingsSheet({
     required this.voices,
     required this.voice,
-    required this.speed,
+    required this.ttsSpeed,
+    required this.playbackMultiplier,
     required this.fontSize,
     required this.showNowReading,
     required this.autoScroll,
+    this.offlineBakedTtsSpeed,
   });
 
   final List<String> voices;
   final String voice;
-  final double speed;
+  final double ttsSpeed;
+  final double playbackMultiplier;
   final double fontSize;
   final bool showNowReading;
   final bool autoScroll;
+
+  /// If non-null, the chapter is a downloaded offline chapter and the TTS
+  /// speed is baked into its PCM. The TTS speed slider is shown read-only.
+  final double? offlineBakedTtsSpeed;
 
   @override
   State<_SessionSettingsSheet> createState() => _SessionSettingsSheetState();
@@ -644,7 +706,8 @@ class _SessionSettingsSheet extends StatefulWidget {
 
 class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
   late String _voice;
-  late double _speed;
+  late double _ttsSpeed;
+  late double _playbackMultiplier;
   late bool _showNowReading;
   late bool _autoScroll;
 
@@ -652,10 +715,13 @@ class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
   void initState() {
     super.initState();
     _voice = widget.voice;
-    _speed = widget.speed;
+    _ttsSpeed = widget.ttsSpeed;
+    _playbackMultiplier = widget.playbackMultiplier;
     _showNowReading = widget.showNowReading;
     _autoScroll = widget.autoScroll;
   }
+
+  bool get _isOffline => widget.offlineBakedTtsSpeed != null;
 
   @override
   Widget build(BuildContext context) {
@@ -672,23 +738,74 @@ class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
             items: widget.voices
                 .map((v) => DropdownMenuItem(value: v, child: Text(v)))
                 .toList(growable: false),
-            onChanged: (v) => setState(() => _voice = v ?? _voice),
-            decoration: const InputDecoration(
-              labelText: 'Voice (this session)',
-              border: OutlineInputBorder(),
+            onChanged: _isOffline ? null : (v) => setState(() => _voice = v ?? _voice),
+            decoration: InputDecoration(
+              labelText: _isOffline ? 'Voice (baked into download)' : 'Voice (this session)',
+              border: const OutlineInputBorder(),
             ),
           ),
-          const SizedBox(height: 12),
-          Text('Speed: ${_speed.toStringAsFixed(2)}x'),
-          Slider(
-            value: _speed,
-            min: 0.7,
-            max: 1.4,
-            divisions: 28,
-            label: '${_speed.toStringAsFixed(2)}x',
-            onChanged: (v) => setState(() => _speed = v),
+          const SizedBox(height: 16),
+
+          // ---- Playback Speed (instant fast-forward) ----
+          Row(
+            children: [
+              const Icon(Icons.fast_forward, size: 18),
+              const SizedBox(width: 6),
+              Text('Playback Speed: ${_playbackMultiplier.toStringAsFixed(2)}×',
+                  style: Theme.of(context).textTheme.bodyMedium),
+            ],
           ),
+          Slider(
+            value: _playbackMultiplier,
+            min: 0.5,
+            max: 3.0,
+            divisions: 50,
+            label: '${_playbackMultiplier.toStringAsFixed(2)}×',
+            onChanged: (v) => setState(() => _playbackMultiplier = v),
+          ),
+          Text(
+            'Instantly fast-forwards audio — like YouTube speed. Works for downloaded chapters too.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 16),
+
+          // ---- TTS Render Speed (Kokoro baked speed) ----
+          Row(
+            children: [
+              const Icon(Icons.record_voice_over, size: 18),
+              const SizedBox(width: 6),
+              Text(
+                _isOffline
+                    ? 'TTS Render Speed: ${widget.offlineBakedTtsSpeed!.toStringAsFixed(2)}× (baked)'
+                    : 'TTS Render Speed: ${_ttsSpeed.toStringAsFixed(2)}×',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+            ],
+          ),
+          if (_isOffline)
+            Text(
+              'This chapter was downloaded at ${widget.offlineBakedTtsSpeed!.toStringAsFixed(2)}×. '
+              'Re-download at a different speed to change TTS tempo.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+            )
+          else ...[
+            Slider(
+              value: _ttsSpeed,
+              min: 0.5,
+              max: 2.0,
+              divisions: 30,
+              label: '${_ttsSpeed.toStringAsFixed(2)}×',
+              onChanged: (v) => setState(() => _ttsSpeed = v),
+            ),
+            Text(
+              'Controls Kokoro TTS render tempo. Changing this will re-synthesise from the current paragraph.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
           const SizedBox(height: 8),
+
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             value: _autoScroll,
@@ -698,7 +815,7 @@ class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             value: _showNowReading,
-            title: const Text('Show “Now reading” box'),
+            title: const Text('Show "Now reading" box'),
             onChanged: (v) => setState(() => _showNowReading = v),
           ),
           const SizedBox(height: 8),
@@ -709,7 +826,8 @@ class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
                 onPressed: () => Navigator.of(context).pop(
                   _SessionSettings(
                     voice: _voice,
-                    speed: _speed,
+                    ttsSpeed: _isOffline ? widget.offlineBakedTtsSpeed! : _ttsSpeed,
+                    playbackMultiplier: _playbackMultiplier,
                     showNowReading: _showNowReading,
                     autoScroll: _autoScroll,
                   ),

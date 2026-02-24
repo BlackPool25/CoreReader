@@ -121,8 +121,9 @@ Backend WS `play` supports `realtime: false` which disables frame pacing so down
 
 ### Offline playback notes
 
-- **TTS speed is baked into the downloaded PCM.** The voice speed selected at download time is permanently encoded in the audio. Changing the speed slider after downloading has no effect on offline chapters; re-download at the desired speed if you want a different rate.
-- **Highlight sync** for offline chapters is driven by a pre-recorded sentence timeline (stored in `meta.json`). Highlight accuracy matches streaming quality.
+- **TTS Render Speed is baked into the downloaded PCM.** The voice speed selected at download time is permanently encoded in the audio. Changing the TTS speed slider after downloading has no effect on offline chapters; re-download at the desired speed if you want a different voice tempo.
+- **Playback Speed (fast-forward) works freely for downloaded chapters.** It is applied via SoLoud and does not require a re-download. Highlight sync automatically tracks the new rate.
+- **Highlight sync** for offline chapters is driven by a pre-recorded sentence timeline (stored in `meta.json`). Timestamps are in milliseconds relative to the start of the raw PCM. The timeline advance rate automatically matches the Playback Speed multiplier.
 - **Voice for auto-downloads** follows the session voice active in the Reader at the time the auto-download is triggered (not the saved default in Settings).
 
 ### Settings (using your phone with your PC as the server)
@@ -140,18 +141,34 @@ Backend WS `play` supports `realtime: false` which disables frame pacing so down
 1. Add a novel (name + NovelCool URL) in **Add novel**.
 2. Open it from **Library** → refresh chapters (cached locally).
 3. Pick a chapter to start reading.
-4. Adjust **default** voice/speed in **Settings** (persisted locally).
-5. In the Reader, you can adjust **session** voice/speed; changes apply instantly by restarting from the current paragraph.
-4. The backend:
+4. Adjust **default** voice and **TTS Render Speed** in **Settings** (persisted locally).
+5. In the Reader, open the **tune ⚙** menu to adjust:
+   - **Voice** (session only; changing restarts synthesis).
+   - **Playback Speed** — instant SoLoud fast-forward, like YouTube 1.5×. Works for live and downloaded chapters. Does **not** re-synthesise audio.
+   - **TTS Render Speed** — changes the Kokoro synthesis tempo; triggers a re-synthesis from the current paragraph (live only). For downloaded chapters this is shown read-only (baked into the PCM at download time).
+6. The backend:
   - scrapes the chapter text from the chapter content container (`div.site-content div.overflow-hidden`)
   - splits into sentences (paragraph-aware) and adds short pauses for more natural pacing
   - pre-synthesizes a few sentences ahead (prefetch) to reduce boundary pauses
-   - streams **sentence-atomic** PCM16 chunks over WebSocket (one binary message per sentence)
-     - each chunk includes a small trailing pause
-     - each sentence audio gets a tiny fade-in/out to avoid boundary clicks
-5. The app plays audio immediately and highlights the currently spoken sentence (synced via sentence metadata from backend).
+  - streams **sentence-atomic** PCM16 chunks over WebSocket (one binary message per sentence)
+    - each chunk includes a small trailing pause
+    - each sentence audio gets a tiny fade-in/out to avoid boundary clicks
+7. The app plays audio immediately. Sentence highlights are **sample-accurate**: the start-sample of each sentence chunk is recorded when it is enqueued into SoLoud, and the highlight fires exactly when `SoLoud.getStreamTimeConsumed()` reaches that sample — no wall-clock estimation, no feedback loop.
 
 > Note: This project is intended for personal/local use.
+
+## Speed architecture
+
+The app has **two independent speed controls** that serve different purposes:
+
+| Control | Where | What it does | Triggers re-synthesis? |
+|---|---|---|---|
+| **TTS Render Speed** | Settings (global) + Reader menu | Sent as `speed` to Kokoro. Controls how fast the voice model speaks. Baked into the synthesised PCM. | Yes (for live chapters) |
+| **Playback Speed** | Reader menu | Passed to `SoLoud.setRelativePlaySpeed()`. Fast-forwards already-generated audio. Like YouTube speed control. | No — instant change |
+
+**Highlight sync at any playback speed**: Because highlights are scheduled at exact PCM sample positions and compared against `getStreamTimeConsumed()` (which reflects the actual consumption rate including the playback multiplier), highlights stay in sync with audio at any Playback Speed without any additional correction.
+
+**Downloads**: The TTS Render Speed is baked into the downloaded PCM at download time and saved in `meta.json`. Changing the global TTS speed after downloading doesn't affect existing downloads. The Playback Speed (fast-forward) can be freely changed for downloaded chapters without re-downloading.
 
 ## Backend required (Android/Web/Desktop)
 

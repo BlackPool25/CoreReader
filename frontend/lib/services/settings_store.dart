@@ -8,7 +8,10 @@ class SettingsStore {
   static const _fontSizeKey = 'reader_font_size';
   static const _themeModeKey = 'theme_mode';
   static const _defaultVoiceKey = 'default_voice';
+  // TTS render speed: the tempo Kokoro generates audio at (baked into PCM).
   static const _defaultSpeedKey = 'default_speed';
+  // Reader playback multiplier: SoLoud fast-forward rate, independent of TTS speed.
+  static const _defaultPlaybackMultiplierKey = 'reader_playback_multiplier_v1';
   static const _libraryGridColumnsKey = 'library_grid_columns';
   static const _libraryGridRowsKey = 'library_grid_rows';
 
@@ -139,15 +142,28 @@ class SettingsStore {
     await prefs.setString(_defaultVoiceKey, v);
   }
 
+  /// TTS render speed: the tempo Kokoro generates audio at (baked into PCM).
+  /// Default 0.9 = slightly slower than natural speech for clarity.
   static Future<double> getDefaultSpeed() async {
     final prefs = await SharedPreferences.getInstance();
-    // Default: slightly slower than 1.0
     return prefs.getDouble(_defaultSpeedKey) ?? 0.9;
   }
 
   static Future<void> setDefaultSpeed(double speed) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_defaultSpeedKey, speed);
+  }
+
+  /// Reader playback multiplier: SoLoud fast-forward rate applied to already-
+  /// synthesised audio. 1.0 = natural speed. Does not affect Kokoro rendering.
+  static Future<double> getDefaultPlaybackMultiplier() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getDouble(_defaultPlaybackMultiplierKey) ?? 1.0;
+  }
+
+  static Future<void> setDefaultPlaybackMultiplier(double speed) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_defaultPlaybackMultiplierKey, speed.clamp(0.5, 3.0));
   }
 
   /// Number of columns for the Library novels grid on phone-sized layouts.
