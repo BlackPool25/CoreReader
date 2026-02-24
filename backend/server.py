@@ -284,8 +284,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     last_key = None
                     cumulative_samples = 0
                     sample_rate = app.state.tts.sample_rate
+                    control_task: asyncio.Task[str] | None = None
                     try:
-                        control_task: asyncio.Task[str] | None = asyncio.create_task(websocket.receive_text())
+                        control_task = asyncio.create_task(websocket.receive_text())
 
                         stream_t0 = time.monotonic()
 
@@ -350,8 +351,6 @@ async def websocket_endpoint(websocket: WebSocket):
                                         "ms_start": ms_start,
                                         "char_start": int(cs),
                                         "char_end": int(ce),
-                                        # Size of the *next* binary message for this sentence in samples/bytes.
-                                        # Helps clients associate metadata with audio even if transport splits chunks.
                                         "chunk_samples": int(len(audio_chunk) // 2),
                                         "chunk_bytes": int(len(audio_chunk)),
                                     }
@@ -360,20 +359,13 @@ async def websocket_endpoint(websocket: WebSocket):
                             cumulative_samples += len(audio_chunk) // 2
 
                             # Optional realtime pacing.
-                            # - streaming: send roughly in-time to reduce client buffer bloat.
-                            # - downloads: realtime=false sends as fast as synthesis allows.
                             if realtime:
                                 expected_s = cumulative_samples / float(sample_rate)
                                 elapsed_s = time.monotonic() - stream_t0
-                                # Let the stream run slightly ahead to avoid stutter from
-                                # small scheduling/network jitter.
                                 ahead_s = 0.10
                                 sleep_s = (expected_s - elapsed_s) - ahead_s
                                 if sleep_s > 0:
                                     await asyncio.sleep(min(sleep_s, 0.25))
-
-                        if control_task is not None:
-                            control_task.cancel()
 
                         await websocket.send_json(
                             {
@@ -382,12 +374,22 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "prev_url": chapter.get("prev_url"),
                             }
                         )
+                    except WebSocketDisconnect:
+                        # Client disconnected mid-stream — propagate so the
+                        # outer handler logs it and stops the while-loop.
+                        raise
                     except Exception as e:
                         logger.error(f"Play stream error: {e}")
                         try:
                             await websocket.send_json({"type": "error", "message": str(e)})
                         except Exception:
-                            pass  # Client already disconnected
+                            pass
+                    finally:
+                        # ALWAYS cancel the pending control_task so the outer
+                        # loop's receive_text() doesn't collide with it.
+                        if control_task is not None:
+                            control_task.cancel()
+                            control_task = None
                 
                 else:
                     await websocket.send_json({"error": "Unknown command"})

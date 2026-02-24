@@ -33,7 +33,7 @@ class ReaderScreen extends StatefulWidget {
 }
 
 class ReaderScreenState extends State<ReaderScreen> {
-  static const int _ttsPrefetchSentences = 8;
+  static const int _ttsPrefetchSentences = 5;
 
   late ReaderStreamController _stream;
   StreamSubscription? _sub;
