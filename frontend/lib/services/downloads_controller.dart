@@ -377,7 +377,11 @@ class DownloadsController extends ChangeNotifier {
                   notifyListeners();
                 }
               } else if (type == 'chapter_complete') {
-                done.complete();
+                // Wait for all queued PCM writes to finish before signaling
+                // completion; otherwise the file may be truncated.
+                writeChain = writeChain.then((_) {
+                  if (!done.isCompleted) done.complete();
+                });
               } else if (type == 'error') {
                 final msg = (obj['message'] as String?) ?? 'Unknown error';
                 if (!done.isCompleted) {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -197,59 +198,68 @@ class LocalStore {
   }
 
   static Future<void> deleteNovelCache(String novelId) async {
+    // Always delete from SharedPreferences (canonical store).
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('$_cachePrefix$novelId');
+
+    // Also try to delete from SAF (secondary backup).
     final tree = await _treeUri();
     if (tree != null && tree.trim().isNotEmpty) {
       try {
         await AndroidSaf.delete(treeUri: tree, pathSegments: _safCachePath(novelId));
       } catch (_) {}
-      return;
     }
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('$_cachePrefix$novelId');
   }
 
   static Future<void> deleteProgress(String novelId) async {
+    // Always delete from SharedPreferences (canonical store).
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('$_progressPrefix$novelId');
+
+    // Also try to delete from SAF (secondary backup).
     final tree = await _treeUri();
     if (tree != null && tree.trim().isNotEmpty) {
       try {
         await AndroidSaf.delete(treeUri: tree, pathSegments: _safProgressPath(novelId));
       } catch (_) {}
-      return;
     }
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('$_progressPrefix$novelId');
   }
 
   static Future<List<StoredNovel>> loadLibrary() async {
+    // SharedPreferences is canonical — always try it first.
+    final novels = await _loadLibraryFromPrefs();
+    if (novels.isNotEmpty) return novels;
+
+    // Fall back: attempt recovery from SAF if prefs is empty.
     final tree = await _treeUri();
     if (tree != null && tree.trim().isNotEmpty) {
       try {
         final raw = await _readSafText(treeUri: tree, path: _safLibraryPath());
-        if (raw == null || raw.isEmpty) {
-          // Migration path: seed SAF storage from existing prefs.
-          final prefsNovels = await _loadLibraryFromPrefs();
-          if (prefsNovels.isNotEmpty) {
-            try {
-              await saveLibrary(prefsNovels);
-            } catch (_) {}
+        if (raw != null && raw.isNotEmpty) {
+          final decoded = jsonDecode(raw);
+          if (decoded is List) {
+            final recovered = decoded
+                .whereType<Map>()
+                .map((m) => StoredNovel.fromJson(m.cast<String, dynamic>()))
+                .where((n) => n.id.isNotEmpty && n.novelUrl.isNotEmpty)
+                .toList(growable: false);
+            if (recovered.isNotEmpty) {
+              // Migrate recovered data back into SharedPreferences.
+              try {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setString(
+                  _libraryKey,
+                  jsonEncode(recovered.map((n) => n.toJson()).toList(growable: false)),
+                );
+              } catch (_) {}
+              return recovered;
+            }
           }
-          return prefsNovels;
         }
-        final decoded = jsonDecode(raw);
-        if (decoded is! List) return const [];
-        return decoded
-            .whereType<Map>()
-            .map((m) => StoredNovel.fromJson(m.cast<String, dynamic>()))
-            .where((n) => n.id.isNotEmpty && n.novelUrl.isNotEmpty)
-            .toList(growable: false);
-      } catch (_) {
-        return const [];
-      }
+      } catch (_) {}
     }
 
-    return _loadLibraryFromPrefs();
+    return const [];
   }
 
   static Future<List<StoredNovel>> _loadLibraryFromPrefs() async {
@@ -270,43 +280,48 @@ class LocalStore {
   }
 
   static Future<void> saveLibrary(List<StoredNovel> novels) async {
-    final tree = await _treeUri();
-    if (tree != null && tree.trim().isNotEmpty) {
-      final raw = jsonEncode(novels.map((n) => n.toJson()).toList(growable: false));
-      await _writeSafText(treeUri: tree, path: _safLibraryPath(), mimeType: 'application/json', text: raw);
-      return;
-    }
-
+    // Always write to SharedPreferences (canonical store).
     final prefs = await SharedPreferences.getInstance();
     final raw = jsonEncode(novels.map((n) => n.toJson()).toList(growable: false));
     await prefs.setString(_libraryKey, raw);
+
+    // Write-through to SAF as secondary backup (fire-and-forget).
+    final tree = await _treeUri();
+    if (tree != null && tree.trim().isNotEmpty) {
+      unawaited(() async {
+        try {
+          await _writeSafText(treeUri: tree, path: _safLibraryPath(), mimeType: 'application/json', text: raw);
+        } catch (_) {}
+      }());
+    }
   }
 
   static Future<StoredNovelCache?> loadNovelCache(String novelId) async {
+    // SharedPreferences is canonical — always try it first.
+    final prefsCache = await _loadNovelCacheFromPrefs(novelId);
+    if (prefsCache != null) return prefsCache;
+
+    // Fall back: attempt recovery from SAF if prefs is empty.
     final tree = await _treeUri();
     if (tree != null && tree.trim().isNotEmpty) {
       try {
         final raw = await _readSafText(treeUri: tree, path: _safCachePath(novelId));
-        if (raw == null || raw.isEmpty) {
-          final prefsCache = await _loadNovelCacheFromPrefs(novelId);
-          if (prefsCache != null) {
+        if (raw != null && raw.isNotEmpty) {
+          final decoded = jsonDecode(raw);
+          if (decoded is Map) {
+            final recovered = StoredNovelCache.fromJson(decoded.cast<String, dynamic>());
+            // Migrate recovered data back into SharedPreferences.
             try {
-              await saveNovelCache(novelId, prefsCache);
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('$_cachePrefix$novelId', jsonEncode(recovered.toJson()));
             } catch (_) {}
+            return recovered;
           }
-          return prefsCache;
         }
-        final decoded = jsonDecode(raw);
-        if (decoded is Map) {
-          return StoredNovelCache.fromJson(decoded.cast<String, dynamic>());
-        }
-      } catch (_) {
-        return null;
-      }
-      return null;
+      } catch (_) {}
     }
 
-    return _loadNovelCacheFromPrefs(novelId);
+    return null;
   }
 
   static Future<StoredNovelCache?> _loadNovelCacheFromPrefs(String novelId) async {
@@ -323,46 +338,53 @@ class LocalStore {
   }
 
   static Future<void> saveNovelCache(String novelId, StoredNovelCache cache) async {
+    // Always write to SharedPreferences (canonical store).
+    final prefs = await SharedPreferences.getInstance();
+    final raw = jsonEncode(cache.toJson());
+    await prefs.setString('$_cachePrefix$novelId', raw);
+
+    // Write-through to SAF as secondary backup (fire-and-forget).
     final tree = await _treeUri();
     if (tree != null && tree.trim().isNotEmpty) {
-      await _writeSafText(
-        treeUri: tree,
-        path: _safCachePath(novelId),
-        mimeType: 'application/json',
-        text: jsonEncode(cache.toJson()),
-      );
-      return;
+      unawaited(() async {
+        try {
+          await _writeSafText(
+            treeUri: tree,
+            path: _safCachePath(novelId),
+            mimeType: 'application/json',
+            text: raw,
+          );
+        } catch (_) {}
+      }());
     }
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('$_cachePrefix$novelId', jsonEncode(cache.toJson()));
   }
 
   static Future<StoredReadingProgress?> loadProgress(String novelId) async {
+    // SharedPreferences is canonical — always try it first.
+    final prefsProgress = await _loadProgressFromPrefs(novelId);
+    if (prefsProgress != null) return prefsProgress;
+
+    // Fall back: attempt recovery from SAF if prefs is empty.
     final tree = await _treeUri();
     if (tree != null && tree.trim().isNotEmpty) {
       try {
         final raw = await _readSafText(treeUri: tree, path: _safProgressPath(novelId));
-        if (raw == null || raw.isEmpty) {
-          final prefsProgress = await _loadProgressFromPrefs(novelId);
-          if (prefsProgress != null) {
+        if (raw != null && raw.isNotEmpty) {
+          final decoded = jsonDecode(raw);
+          if (decoded is Map) {
+            final recovered = StoredReadingProgress.fromJson(decoded.cast<String, dynamic>());
+            // Migrate recovered data back into SharedPreferences.
             try {
-              await saveProgress(prefsProgress);
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('$_progressPrefix${recovered.novelId}', jsonEncode(recovered.toJson()));
             } catch (_) {}
+            return recovered;
           }
-          return prefsProgress;
         }
-        final decoded = jsonDecode(raw);
-        if (decoded is Map) {
-          return StoredReadingProgress.fromJson(decoded.cast<String, dynamic>());
-        }
-      } catch (_) {
-        return null;
-      }
-      return null;
+      } catch (_) {}
     }
 
-    return _loadProgressFromPrefs(novelId);
+    return null;
   }
 
   static Future<StoredReadingProgress?> _loadProgressFromPrefs(String novelId) async {
@@ -379,18 +401,24 @@ class LocalStore {
   }
 
   static Future<void> saveProgress(StoredReadingProgress progress) async {
+    // Always write to SharedPreferences (canonical store).
+    final prefs = await SharedPreferences.getInstance();
+    final raw = jsonEncode(progress.toJson());
+    await prefs.setString('$_progressPrefix${progress.novelId}', raw);
+
+    // Write-through to SAF as secondary backup (fire-and-forget).
     final tree = await _treeUri();
     if (tree != null && tree.trim().isNotEmpty) {
-      await _writeSafText(
-        treeUri: tree,
-        path: _safProgressPath(progress.novelId),
-        mimeType: 'application/json',
-        text: jsonEncode(progress.toJson()),
-      );
-      return;
+      unawaited(() async {
+        try {
+          await _writeSafText(
+            treeUri: tree,
+            path: _safProgressPath(progress.novelId),
+            mimeType: 'application/json',
+            text: raw,
+          );
+        } catch (_) {}
+      }());
     }
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('$_progressPrefix${progress.novelId}', jsonEncode(progress.toJson()));
   }
 }

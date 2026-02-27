@@ -33,7 +33,7 @@ class ReaderScreen extends StatefulWidget {
 }
 
 class ReaderScreenState extends State<ReaderScreen> {
-  static const int _ttsPrefetchSentences = 5;
+  static const int _ttsPrefetchSentences = 8;
 
   late ReaderStreamController _stream;
   StreamSubscription? _sub;
@@ -51,7 +51,6 @@ class ReaderScreenState extends State<ReaderScreen> {
   /// Works identically for both live-streamed and downloaded chapters.
   double _playbackMultiplier = 1.0;
 
-  String? _title;
   String? _chapterUrl;
   String? _nextUrl;
   String? _prevUrl;
@@ -141,7 +140,6 @@ class ReaderScreenState extends State<ReaderScreen> {
     if (type == 'chapter_info') {
       final paras = (e['paragraphs'] as List?)?.map((x) => x.toString()).toList() ?? const <String>[];
       setState(() {
-        _title = e['title'] as String?;
         _chapterUrl = e['url'] as String?;
         _nextUrl = e['next_url'] as String?;
         _prevUrl = e['prev_url'] as String?;
@@ -393,7 +391,15 @@ class ReaderScreenState extends State<ReaderScreen> {
 
   Future<void> _pauseOrResume() async {
     if (_stream.paused) {
-      await _stream.resume();
+      // On resume, restart from the last sentence the user actually heard.
+      // This eliminates the gap between what the audio buffer had enqueued
+      // and what the user actually heard before pausing.
+      final heardPara = _stream.lastHeardParagraphIndex;
+      if (heardPara >= 0) {
+        await _playChapter(_chapter, startParagraph: heardPara);
+      } else {
+        await _stream.resume();
+      }
       setState(() {});
     } else {
       await _stream.pause();
@@ -425,7 +431,7 @@ class ReaderScreenState extends State<ReaderScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(_title ?? 'Chapter ${_chapter.n}'),
+        title: Text('Chapter ${_chapter.n}'),
         actions: [
           IconButton(
             tooltip: 'Reload voices',
@@ -727,10 +733,11 @@ class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
   Widget build(BuildContext context) {
     return SafeArea(
       minimum: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
           Text('Session settings', style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 12),
           DropdownButtonFormField<String>(
@@ -837,6 +844,7 @@ class _SessionSettingsSheetState extends State<_SessionSettingsSheet> {
             ],
           ),
         ],
+        ),
       ),
     );
   }

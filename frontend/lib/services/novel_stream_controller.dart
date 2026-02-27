@@ -50,6 +50,25 @@ class _ScheduledSentence {
   final Map<String, dynamic> event;
 }
 
+/// A cached sentence PCM chunk with its metadata event.
+class _CachedSentence {
+  _CachedSentence({required this.pcm, required this.event});
+  final Uint8List pcm;
+  final Map<String, dynamic>? event;
+}
+
+/// In-memory audio cache for a single chapter, keyed by URL.
+class _ChapterAudioCache {
+  _ChapterAudioCache({required this.url, required this.chapterInfoEvent});
+  final String url;
+  final Map<String, dynamic> chapterInfoEvent;
+  /// Ordered list of cached sentences — each contains PCM and metadata.
+  final List<_CachedSentence> sentences = [];
+  /// Paragraph index of the first cached sentence (always 0 for full chapters).
+  int startParagraph = 0;
+  bool chapterComplete = false;
+}
+
 class NovelStreamController implements ReaderStreamController {
   final _eventsController = StreamController<Map<String, dynamic>>.broadcast();
   @override
@@ -126,6 +145,114 @@ class NovelStreamController implements ReaderStreamController {
   bool _paused = false;
   @override
   bool get paused => _paused;
+
+  int _lastHeardParagraphIndex = -1;
+  @override
+  int get lastHeardParagraphIndex => _lastHeardParagraphIndex;
+
+  // ---------------------------------------------------------------------------
+  // In-memory audio cache (sliding window of up to 3 chapters)
+  // ---------------------------------------------------------------------------
+  static const int _maxCachedChapters = 3;
+  final List<_ChapterAudioCache> _audioCache = [];
+  /// The URL of the chapter currently being streamed into cache.
+  String? _currentlyCachingUrl;
+
+  _ChapterAudioCache? _cacheForUrl(String url) {
+    for (final c in _audioCache) {
+      if (c.url == url) return c;
+    }
+    return null;
+  }
+
+  void _evictOldCaches() {
+    while (_audioCache.length > _maxCachedChapters) {
+      _audioCache.removeAt(0);
+    }
+  }
+
+  @override
+  bool hasCachedAudio(String url, int startParagraph) {
+    final cache = _cacheForUrl(url);
+    if (cache == null || cache.sentences.isEmpty) return false;
+    // Check if we have any sentence at or after the requested paragraph.
+    return cache.sentences.any((s) {
+      final pIdx = (s.event?['paragraph_index'] as num?)?.toInt() ?? -1;
+      return pIdx >= startParagraph;
+    });
+  }
+
+  @override
+  Future<bool> replayFromCache({
+    required String url,
+    required int startParagraph,
+  }) async {
+    final cache = _cacheForUrl(url);
+    if (cache == null || cache.sentences.isEmpty) return false;
+
+    await stop();
+
+    // Re-emit chapter_info so the reader rebuilds paragraphs.
+    _eventsController.add(cache.chapterInfoEvent);
+
+    final audio = (cache.chapterInfoEvent['audio'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
+    final sampleRate = (audio['sample_rate'] as num?)?.toInt() ?? 24000;
+    await _ensureAudioStream(sampleRate);
+
+    // Find the first cached sentence at or after the requested paragraph.
+    var startIdx = 0;
+    for (var i = 0; i < cache.sentences.length; i++) {
+      final pIdx = (cache.sentences[i].event?['paragraph_index'] as num?)?.toInt() ?? -1;
+      if (pIdx >= startParagraph) {
+        startIdx = i;
+        break;
+      }
+    }
+
+    _startLiveTimeline();
+
+    // Enqueue cached PCM into SoLoud and schedule highlights.
+    for (var i = startIdx; i < cache.sentences.length; i++) {
+      final item = cache.sentences[i];
+      if (item.pcm.isNotEmpty) {
+        if (!_clockStarted) {
+          _clockStarted = true;
+          _playbackClock.reset();
+          _playbackClock.start();
+        }
+        final startMs = (_enqueuedSamples * 1000) ~/ sampleRate;
+        _soloud.addAudioDataStream(_audioSource!, item.pcm);
+        _enqueuedSamples += item.pcm.length ~/ 2;
+        _enqueuedMs = (_enqueuedSamples * 1000) ~/ sampleRate;
+
+        if (item.event != null) {
+          _scheduledLiveSentences.add(
+            _ScheduledSentence(startMs: startMs, event: item.event!),
+          );
+        }
+      }
+      // Yield every few chunks to keep UI responsive.
+      if ((i - startIdx) % 10 == 9) {
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+
+    if (cache.chapterComplete) {
+      try {
+        _soloud.setDataIsEnded(_audioSource!);
+      } catch (_) {}
+      // Wait for audio to finish, then emit chapter_complete.
+      unawaited(() async {
+        while (_handle != null && _soloud.getIsValidVoiceHandle(_handle!)) {
+          await Future<void>.delayed(const Duration(milliseconds: 120));
+        }
+        _eventsController.add({'type': 'chapter_complete', 'next_url': null, 'prev_url': null});
+      }());
+    }
+
+    _connected = false; // Not connected to WS, but audio is active via cache.
+    return true;
+  }
 
   /// Initialize the audio engine in response to a user gesture.
   ///
@@ -221,6 +348,9 @@ class NovelStreamController implements ReaderStreamController {
           final next = _scheduledLiveSentences.first;
           if (next.startMs > elapsedMs) break;
           _scheduledLiveSentences.removeAt(0);
+          // Track the last actually-heard sentence for pause-resume accuracy.
+          final pIdx = (next.event['paragraph_index'] as num?)?.toInt();
+          if (pIdx != null) _lastHeardParagraphIndex = pIdx;
           _eventsController.add(next.event);
         }
       } catch (_) {
@@ -280,6 +410,13 @@ class NovelStreamController implements ReaderStreamController {
               _ScheduledSentence(startMs: startMs, event: evt),
             );
           }
+
+          // Store in in-memory cache for potential rewind.
+          if (_currentlyCachingUrl != null) {
+            _cacheForUrl(_currentlyCachingUrl!)?.sentences.add(
+              _CachedSentence(pcm: Uint8List.fromList(aligned), event: item.event),
+            );
+          }
         }
       } catch (_) {
         // ignore individual chunk errors
@@ -315,6 +452,8 @@ class NovelStreamController implements ReaderStreamController {
     int startParagraph = 0,
   }) async {
     await stop();
+
+    _currentlyCachingUrl = url;
 
     final base = await SettingsStore.getServerBaseUrl();
     final wsUri = SettingsStore.wsUri(base);
@@ -355,10 +494,23 @@ class NovelStreamController implements ReaderStreamController {
               } catch (e) {
                 _eventsController.add({'type': 'error', 'message': _formatAudioInitError(e)});
               }
+              // Initialise in-memory cache for this chapter.
+              if (_currentlyCachingUrl != null) {
+                _audioCache.removeWhere((c) => c.url == _currentlyCachingUrl);
+                _audioCache.add(_ChapterAudioCache(
+                  url: _currentlyCachingUrl!,
+                  chapterInfoEvent: obj,
+                ));
+                _evictOldCaches();
+              }
             }
             if (obj['type'] == 'chapter_complete') {
               _remoteChapterComplete = true;
               _pumpSentenceAudio();
+              // Mark cache as complete.
+              if (_currentlyCachingUrl != null) {
+                _cacheForUrl(_currentlyCachingUrl!)?.chapterComplete = true;
+              }
             }
           }
           return;
@@ -543,6 +695,9 @@ class NovelStreamController implements ReaderStreamController {
             if (item['cs'] != null) 'char_start': (item['cs'] as num?)?.toInt() ?? 0,
             if (item['ce'] != null) 'char_end': (item['ce'] as num?)?.toInt() ?? 0,
           });
+          // Track last-heard paragraph for offline playback too.
+          final pIdxOff = (item['p'] as num?)?.toInt();
+          if (pIdxOff != null) _lastHeardParagraphIndex = pIdxOff;
         }
       } catch (_) {
         // ignore
@@ -560,6 +715,10 @@ class NovelStreamController implements ReaderStreamController {
     final skipBytes = ((_offlineStartMs / 1000.0) * sampleRate * 2).round();
     var skipped = 0;
 
+    // Pre-buffer ~2s of audio before starting the playback clock to avoid
+    // glitches at the beginning of downloaded chapter playback.
+    final preBufferBytes = sampleRate * 2 * 2; // 2 seconds of PCM16 mono
+    var preBuffered = 0;
     var chunkCount = 0;
     try {
       while (_offlineActive) {
@@ -577,6 +736,8 @@ class NovelStreamController implements ReaderStreamController {
             final aligned = _alignPcm16(sliced);
             if (aligned.isNotEmpty) {
               _soloud.addAudioDataStream(_audioSource!, aligned);
+              _offlineEnqueuedSamples += aligned.length ~/ 2;
+              preBuffered += aligned.length;
             }
           }
           continue;
@@ -584,19 +745,30 @@ class NovelStreamController implements ReaderStreamController {
 
         final aligned = _alignPcm16(chunk);
         if (aligned.isNotEmpty) {
-          if (!_clockStarted) {
+          _soloud.addAudioDataStream(_audioSource!, aligned);
+          _offlineEnqueuedSamples += aligned.length ~/ 2;
+          preBuffered += aligned.length;
+          // Start the playback clock only after pre-buffering is complete.
+          if (!_clockStarted && preBuffered >= preBufferBytes) {
             _clockStarted = true;
             _playbackClock.reset();
             _playbackClock.start();
           }
-          _soloud.addAudioDataStream(_audioSource!, aligned);
-          _offlineEnqueuedSamples += aligned.length ~/ 2;
         }
 
         chunkCount++;
-        if ((chunkCount % 6) == 0) {
-          await Future<void>.delayed(const Duration(milliseconds: 2));
+        // Yield every 4 chunks (~256KB) to keep the UI responsive and avoid
+        // overwhelming the SoLoud buffer.
+        if ((chunkCount % 4) == 0) {
+          await Future<void>.delayed(const Duration(milliseconds: 4));
         }
+      }
+
+      // Start the clock in case the file was shorter than the pre-buffer target.
+      if (!_clockStarted && _offlineEnqueuedSamples > 0) {
+        _clockStarted = true;
+        _playbackClock.reset();
+        _playbackClock.start();
       }
 
       if (_pcmCarryByte != null && _audioSource != null) {
@@ -735,6 +907,7 @@ class NovelStreamController implements ReaderStreamController {
     _clockStarted = false;
     _playbackClock.stop();
     _playbackClock.reset();
+    _lastHeardParagraphIndex = -1;
   }
 
   Uint8List _alignPcm16(Uint8List bytes) {

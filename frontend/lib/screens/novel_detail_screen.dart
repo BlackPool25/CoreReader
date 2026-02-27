@@ -479,7 +479,7 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
           ),
         ],
       ),
-      body: _busy
+      body: chapters.isEmpty && _busy
           ? const Center(child: CircularProgressIndicator())
           : chapters.isEmpty
               ? Center(
@@ -491,6 +491,9 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
                 )
               : Column(
                   children: [
+                    // Non-blocking progress indicator shown during refresh.
+                    if (_busy)
+                      const LinearProgressIndicator(),
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
                       child: Row(

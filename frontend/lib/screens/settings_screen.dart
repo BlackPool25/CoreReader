@@ -18,7 +18,7 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   final _controller = TextEditingController();
   final _newServerController = TextEditingController();
-  bool _loading = true;
+  bool _loadingVoices = false;
   bool _didInit = false;
   double _fontSize = 16.0;
 
@@ -84,12 +84,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _downloadsTreeUri = settings.downloadsTreeUri;
     _downloadsPrefetchAhead = settings.downloadsPrefetchAhead;
     _downloadsKeepBehind = settings.downloadsKeepBehind;
-    await _loadVoices();
-    if (!mounted) return;
-    setState(() => _loading = false);
+    // Render immediately with cached settings; fetch voices in background.
+    setState(() {});
+    unawaited(_loadVoices());
   }
 
   Future<void> _loadVoices() async {
+    if (!mounted) return;
+    setState(() => _loadingVoices = true);
     try {
       final base = _controller.text.trim();
       final uri = SettingsStore.httpUri(base, '/voices');
@@ -98,7 +100,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final decoded = jsonDecode(res.body);
       if (decoded is Map && decoded['voices'] is List) {
         final voices = (decoded['voices'] as List).map((e) => e.toString()).toList();
-        if (voices.isNotEmpty) {
+        if (voices.isNotEmpty && mounted) {
           setState(() {
             _voices = voices;
             if (_defaultVoice == null || !_voices.contains(_defaultVoice)) {
@@ -109,6 +111,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
     } catch (_) {
       // Ignore; we'll just keep the selector empty.
+    } finally {
+      if (mounted) setState(() => _loadingVoices = false);
     }
   }
 
@@ -153,7 +157,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) return const Center(child: CircularProgressIndicator());
 
     return Padding(
       padding: const EdgeInsets.all(16),
@@ -363,14 +366,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
               Text('Default voice', style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 8),
-              DropdownButtonFormField<String>(
-                initialValue: _defaultVoice,
-                items: _voices
-                    .map((v) => DropdownMenuItem(value: v, child: Text(v)))
-                    .toList(growable: false),
-                onChanged: (v) => setState(() => _defaultVoice = v),
-                decoration: const InputDecoration(border: OutlineInputBorder()),
-              ),
+              if (_loadingVoices && _voices.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 8),
+                  child: Row(
+                    children: [
+                      SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                      SizedBox(width: 10),
+                      Text('Loading voices from backend…'),
+                    ],
+                  ),
+                )
+              else
+                DropdownButtonFormField<String>(
+                  initialValue: _defaultVoice,
+                  items: _voices
+                      .map((v) => DropdownMenuItem(value: v, child: Text(v)))
+                      .toList(growable: false),
+                  onChanged: (v) => setState(() => _defaultVoice = v),
+                  decoration: const InputDecoration(border: OutlineInputBorder()),
+                ),
               const SizedBox(height: 12),
               Text(
                 'TTS Render Speed: ${_defaultSpeed.toStringAsFixed(2)}×',
