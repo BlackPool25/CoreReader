@@ -58,10 +58,10 @@ Open **Settings** in the app and paste your backend URL:
 ## How It Works
 
 ```
-┌─────────────┐       WS /ws        ┌──────────────┐
-│  Flutter App │ ◄──────────────────► │   Backend    │
-│  (player)    │   PCM16 audio +     │  (FastAPI)   │
-│              │   sentence events   │              │
+┌─────────────┐       WS /ws         ┌──────────────┐
+│  Flutter App│ ◄──────────────────► │   Backend    │
+│  (player)   │   PCM16 audio +      │  (FastAPI)   │
+│             │   sentence events    │              │
 └─────────────┘                      │  ┌─────────┐ │
                                      │  │ Scraper │ │  ← NovelCool
                                      │  │ Kokoro  │ │  ← TTS (CPU)
