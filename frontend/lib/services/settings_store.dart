@@ -23,6 +23,13 @@ class SettingsStore {
   static const _downloadPrefetchAheadKey = 'downloads_prefetch_ahead_v1';
   static const _downloadKeepBehindKey = 'downloads_keep_behind_v1';
 
+  // Novel detail screen: persisted filter / sort / display
+  static const _chapterFilterDownloadedKey = 'chapter_filter_downloaded_v1';
+  static const _chapterFilterUnreadKey = 'chapter_filter_unread_v1';
+  static const _chapterSortAscendingKey = 'chapter_sort_ascending_v1';
+  static const _chapterDisplayGridKey = 'chapter_display_grid_v1';
+  static const _chapterGridColumnsKey = 'chapter_grid_columns_v1';
+
   /// Base URL including scheme and port, e.g. `ws://192.168.1.45:8000`.
   static Future<String> getServerBaseUrl() async {
     final prefs = await SharedPreferences.getInstance();
@@ -263,6 +270,60 @@ class SettingsStore {
   static Future<void> setDownloadsKeepBehind(int v) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_downloadKeepBehindKey, v.clamp(0, 10));
+  }
+
+  // --- Chapter filter / sort / display persistence ---
+
+  /// Tri-state: 0 = off, 1 = include, 2 = exclude
+  static Future<int> getChapterFilterDownloaded() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getInt(_chapterFilterDownloadedKey) ?? 0).clamp(0, 2);
+  }
+
+  static Future<void> setChapterFilterDownloaded(int v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_chapterFilterDownloadedKey, v.clamp(0, 2));
+  }
+
+  static Future<int> getChapterFilterUnread() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getInt(_chapterFilterUnreadKey) ?? 0).clamp(0, 2);
+  }
+
+  static Future<void> setChapterFilterUnread(int v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_chapterFilterUnreadKey, v.clamp(0, 2));
+  }
+
+  static Future<bool> getChapterSortAscending() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_chapterSortAscendingKey) ?? true;
+  }
+
+  static Future<void> setChapterSortAscending(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_chapterSortAscendingKey, v);
+  }
+
+  static Future<bool> getChapterDisplayGrid() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_chapterDisplayGridKey) ?? false;
+  }
+
+  static Future<void> setChapterDisplayGrid(bool v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_chapterDisplayGridKey, v);
+  }
+
+  static Future<int> getChapterGridColumns() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = prefs.getInt(_chapterGridColumnsKey) ?? 3;
+    return v.clamp(2, 4);
+  }
+
+  static Future<void> setChapterGridColumns(int v) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_chapterGridColumnsKey, v.clamp(2, 4));
   }
 
   static Uri wsUri(String serverBaseUrl) {

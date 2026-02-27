@@ -141,11 +141,12 @@ class NovelCoolScraper:
             abs_url = urljoin(novel_url, href)
             if abs_url in seen:
                 continue
-            seen.add(abs_url)
             title = a.get_text(' ', strip=True)
             if not title:
-                # Some chapter links have empty text (icons). Skip.
+                # Some chapter links have empty text (icons). Skip but do NOT
+                # mark as seen — the real link with text may appear later.
                 continue
+            seen.add(abs_url)
             n = parse_chapter_number(title, abs_url)
             links.append({"n": n, "title": title, "url": abs_url})
 

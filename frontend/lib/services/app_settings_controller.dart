@@ -37,6 +37,13 @@ class AppSettingsController extends ChangeNotifier {
   int _downloadsPrefetchAhead = 2;
   int _downloadsKeepBehind = 1;
 
+  // Chapter filter / sort / display (persisted across sessions)
+  int _chapterFilterDownloaded = 0; // 0=off, 1=include, 2=exclude
+  int _chapterFilterUnread = 0;
+  bool _chapterSortAscending = true;
+  bool _chapterDisplayGrid = false;
+  int _chapterGridColumns = 3;
+
   ThemeMode get themeMode => _themeMode;
   String get serverBaseUrl => _serverBaseUrl;
   List<String> get serverBaseUrls => _serverBaseUrls;
@@ -57,6 +64,12 @@ class AppSettingsController extends ChangeNotifier {
   int get downloadsPrefetchAhead => _downloadsPrefetchAhead;
   int get downloadsKeepBehind => _downloadsKeepBehind;
 
+  int get chapterFilterDownloaded => _chapterFilterDownloaded;
+  int get chapterFilterUnread => _chapterFilterUnread;
+  bool get chapterSortAscending => _chapterSortAscending;
+  bool get chapterDisplayGrid => _chapterDisplayGrid;
+  int get chapterGridColumns => _chapterGridColumns;
+
   Future<void> load() async {
     _themeMode = _parseThemeMode(await SettingsStore.getThemeMode());
     _serverBaseUrl = await SettingsStore.getServerBaseUrl();
@@ -75,6 +88,12 @@ class AppSettingsController extends ChangeNotifier {
     _downloadsTreeUri = await SettingsStore.getDownloadsTreeUri();
     _downloadsPrefetchAhead = await SettingsStore.getDownloadsPrefetchAhead();
     _downloadsKeepBehind = await SettingsStore.getDownloadsKeepBehind();
+
+    _chapterFilterDownloaded = await SettingsStore.getChapterFilterDownloaded();
+    _chapterFilterUnread = await SettingsStore.getChapterFilterUnread();
+    _chapterSortAscending = await SettingsStore.getChapterSortAscending();
+    _chapterDisplayGrid = await SettingsStore.getChapterDisplayGrid();
+    _chapterGridColumns = await SettingsStore.getChapterGridColumns();
     notifyListeners();
   }
 
@@ -199,5 +218,45 @@ class AppSettingsController extends ChangeNotifier {
     _downloadsKeepBehind = clamped;
     notifyListeners();
     await SettingsStore.setDownloadsKeepBehind(clamped);
+  }
+
+  // --- Chapter filter / sort / display ---
+
+  Future<void> setChapterFilterDownloaded(int v) async {
+    final clamped = v.clamp(0, 2);
+    if (_chapterFilterDownloaded == clamped) return;
+    _chapterFilterDownloaded = clamped;
+    notifyListeners();
+    await SettingsStore.setChapterFilterDownloaded(clamped);
+  }
+
+  Future<void> setChapterFilterUnread(int v) async {
+    final clamped = v.clamp(0, 2);
+    if (_chapterFilterUnread == clamped) return;
+    _chapterFilterUnread = clamped;
+    notifyListeners();
+    await SettingsStore.setChapterFilterUnread(clamped);
+  }
+
+  Future<void> setChapterSortAscending(bool v) async {
+    if (_chapterSortAscending == v) return;
+    _chapterSortAscending = v;
+    notifyListeners();
+    await SettingsStore.setChapterSortAscending(v);
+  }
+
+  Future<void> setChapterDisplayGrid(bool v) async {
+    if (_chapterDisplayGrid == v) return;
+    _chapterDisplayGrid = v;
+    notifyListeners();
+    await SettingsStore.setChapterDisplayGrid(v);
+  }
+
+  Future<void> setChapterGridColumns(int v) async {
+    final clamped = v.clamp(2, 4);
+    if (_chapterGridColumns == clamped) return;
+    _chapterGridColumns = clamped;
+    notifyListeners();
+    await SettingsStore.setChapterGridColumns(clamped);
   }
 }

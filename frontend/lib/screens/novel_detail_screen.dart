@@ -29,6 +29,23 @@ _TriState _nextTriState(_TriState s) {
   }
 }
 
+_TriState _triStateFromInt(int v) {
+  if (v == 1) return _TriState.include;
+  if (v == 2) return _TriState.exclude;
+  return _TriState.off;
+}
+
+int _triStateToInt(_TriState s) {
+  switch (s) {
+    case _TriState.off:
+      return 0;
+    case _TriState.include:
+      return 1;
+    case _TriState.exclude:
+      return 2;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
@@ -60,6 +77,7 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
   final Set<int> _selected = {};
 
   bool _didSyncDownloads = false;
+  bool _didLoadSettings = false;
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -133,16 +151,29 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    if (_didSyncDownloads) return;
-    _didSyncDownloads = true;
-
     final settings = AppSettingsScope.of(context);
-    final tree = settings.downloadsTreeUri;
-    if (tree == null || tree.trim().isEmpty) return;
-    final downloads = DownloadsScope.of(context);
-    unawaited(
-      downloads.reconcileWithDisk(treeUri: tree, novelId: widget.novel.id).catchError((_) {}),
-    );
+
+    // Load persisted chapter display settings once.
+    if (!_didLoadSettings) {
+      _didLoadSettings = true;
+      _downloadedFilter = _triStateFromInt(settings.chapterFilterDownloaded);
+      _unreadFilter = _triStateFromInt(settings.chapterFilterUnread);
+      _sortAscending = settings.chapterSortAscending;
+      _chaptersGrid = settings.chapterDisplayGrid;
+      _gridColumns = settings.chapterGridColumns;
+    }
+
+    // Reconcile download state with disk once.
+    if (!_didSyncDownloads) {
+      _didSyncDownloads = true;
+      final tree = settings.downloadsTreeUri;
+      if (tree != null && tree.trim().isNotEmpty) {
+        final downloads = DownloadsScope.of(context);
+        unawaited(
+          downloads.reconcileWithDisk(treeUri: tree, novelId: widget.novel.id).catchError((_) {}),
+        );
+      }
+    }
   }
 
   void _enterSelection(int chapterN) {
@@ -438,12 +469,28 @@ class _NovelDetailScreenState extends State<NovelDetailScreen> {
             bool? chaptersGrid,
             int? gridColumns,
           }) {
+            final settings = AppSettingsScope.of(context);
             setState(() {
-              if (downloadedFilter != null) _downloadedFilter = downloadedFilter;
-              if (unreadFilter != null) _unreadFilter = unreadFilter;
-              if (sortAscending != null) _sortAscending = sortAscending;
-              if (chaptersGrid != null) _chaptersGrid = chaptersGrid;
-              if (gridColumns != null) _gridColumns = gridColumns;
+              if (downloadedFilter != null) {
+                _downloadedFilter = downloadedFilter;
+                settings.setChapterFilterDownloaded(_triStateToInt(downloadedFilter));
+              }
+              if (unreadFilter != null) {
+                _unreadFilter = unreadFilter;
+                settings.setChapterFilterUnread(_triStateToInt(unreadFilter));
+              }
+              if (sortAscending != null) {
+                _sortAscending = sortAscending;
+                settings.setChapterSortAscending(sortAscending);
+              }
+              if (chaptersGrid != null) {
+                _chaptersGrid = chaptersGrid;
+                settings.setChapterDisplayGrid(chaptersGrid);
+              }
+              if (gridColumns != null) {
+                _gridColumns = gridColumns;
+                settings.setChapterGridColumns(gridColumns);
+              }
             });
           },
         );
