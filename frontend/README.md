@@ -66,3 +66,44 @@ interactive while the backend responds.
   the playback clock, eliminating initial glitches.
 - **Pacing**: Yield frequency during offline PCM loading increased to every 4
   chunks with a 4ms delay to avoid overwhelming the SoLoud buffer.
+
+## Mihon-Style Chapter Management (Novel Detail Screen)
+
+The novel detail screen was rewritten with a Mihon-inspired chapter management
+experience.
+
+### Filter / Sort / Display Bottom Sheet
+A tabbed bottom sheet (opened via the filter icon in the AppBar) with three tabs:
+
+- **Filter**: Tri-state checkboxes for **Downloaded** and **Unread**. Each cycles
+  through Off → Include only → Exclude → Off, matching Mihon's behavior.
+- **Sort**: Toggle between ascending and descending chapter order.
+- **Display**: Switch between list and grid view. Grid mode offers 2, 3, or 4
+  column options via ChoiceChips. Labels auto-shorten to just the chapter number
+  when columns ≥ 3 to ensure visibility.
+
+### Selection Bottom Action Bar
+Long-pressing a chapter enters selection mode. A bottom action bar appears with:
+Select all, Mark read, Mark unread, Mark previous as read, Download, Delete.
+
+The **Mark previous as read** action marks all chapters before the lowest
+selected chapter as read — useful for catching up when you start reading
+mid-novel.
+
+### Mihon-Style Cover Header
+The novel detail screen now displays a cover header at the top (like Mihon):
+- Blurred cover image background with gradient fade
+- Cover thumbnail (100×140) on the left
+- Novel title, source domain, and stats (chapter count, downloaded, read) on the
+  right
+- Full-width **Resume** button showing the current chapter when progress exists
+
+### Simplified AppBar
+- **Filter icon**: Opens the Filter/Sort/Display sheet. Icon switches to
+  `filter_list_off` when filters are active.
+- **Refresh icon**: Refreshes the chapter list.
+- **Overflow menu**: Grouped logically — Download actions (all / next 5 / 10 /
+  25), divider, Delete downloads, divider, Refresh cover, divider, Remove from
+  library.
+- **Selection mode**: Shows selected count + close button; actions are in the
+  bottom bar instead.
