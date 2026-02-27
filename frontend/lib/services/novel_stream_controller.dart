@@ -382,6 +382,9 @@ class NovelStreamController implements ReaderStreamController {
 
   void _pumpSentenceAudio() {
     if (_audioSource == null) return;
+    // Don't enqueue new audio while paused — prevents buffer from growing
+    // and keeps the pause position accurate.
+    if (_paused) return;
     final sr = _streamSampleRate ?? 24000;
 
     // Drain all assembled chunks into SoLoud unconditionally.
@@ -821,14 +824,29 @@ class NovelStreamController implements ReaderStreamController {
   Future<void> pause() async {
     if (_paused) return;
     _paused = true;
-    // Freeze the playback clock so highlights stop advancing.
+
+    // 1. Stop audio output FIRST — this is the critical user-facing action.
+    //    Must come before the WS send which can throw on flaky connections.
+    if (_handle != null) {
+      try {
+        _soloud.setPause(_handle!, true);
+      } catch (_) {}
+    }
+
+    // 2. Freeze the playback clock so highlights stop advancing.
     _accumulatedPlaybackMs = _playbackElapsedMs();
     _playbackClock.stop();
+    _playbackClock.reset(); // Reset so _playbackElapsedMs() doesn't double-count.
+
+    // 3. Cancel highlight timers — no events should fire while paused.
+    _liveTimelineTimer?.cancel();
+    _offlineTimelineTimer?.cancel();
+
+    // 4. Tell the backend to stop sending new audio.
     if (_connected && _channel != null) {
-      _channel!.sink.add(jsonEncode({'command': 'pause'}));
-    }
-    if (_handle != null) {
-      _soloud.setPause(_handle!, true);
+      try {
+        _channel!.sink.add(jsonEncode({'command': 'pause'}));
+      } catch (_) {}
     }
   }
 
@@ -836,14 +854,58 @@ class NovelStreamController implements ReaderStreamController {
   Future<void> resume() async {
     if (!_paused) return;
     _paused = false;
+
     // Resume the playback clock from where we paused.
     _playbackClock.reset();
     _playbackClock.start();
+
+    // Resume audio output.
     if (_handle != null) {
-      _soloud.setPause(_handle!, false);
+      try {
+        _soloud.setPause(_handle!, false);
+      } catch (_) {}
     }
+
+    // Restart highlight timers.
+    if (_scheduledLiveSentences.isNotEmpty) {
+      _startLiveTimeline();
+    }
+    // Offline timeline timer is restarted only if offline playback is active.
+    if (_offlineActive && _offlineTimeline.isNotEmpty) {
+      _offlineTimelineTimer?.cancel();
+      _offlineTimelineTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
+        if (!_offlineActive || _audioSource == null) return;
+        try {
+          final elapsedMs = _playbackElapsedMs();
+          final sr = _streamSampleRate ?? 24000;
+          final maxPlayableMs = _offlineStartMs + (((_offlineEnqueuedSamples * 1000) / sr).floor());
+          final rawT = elapsedMs + _offlineStartMs;
+          final t = rawT <= maxPlayableMs ? rawT : maxPlayableMs;
+          while (_offlineTimelineIdx < _offlineTimeline.length) {
+            final item = _offlineTimeline[_offlineTimelineIdx];
+            final ms = (item['ms'] as num?)?.toInt() ?? 0;
+            if (ms > t) break;
+            _offlineTimelineIdx++;
+            _eventsController.add({
+              'type': 'sentence',
+              'text': (item['text'] as String?) ?? '',
+              'paragraph_index': (item['p'] as num?)?.toInt() ?? 0,
+              'sentence_index': (item['s'] as num?)?.toInt() ?? 0,
+              if (item['cs'] != null) 'char_start': (item['cs'] as num?)?.toInt() ?? 0,
+              if (item['ce'] != null) 'char_end': (item['ce'] as num?)?.toInt() ?? 0,
+            });
+            final pIdxOff = (item['p'] as num?)?.toInt();
+            if (pIdxOff != null) _lastHeardParagraphIndex = pIdxOff;
+          }
+        } catch (_) {}
+      });
+    }
+
+    // Tell the backend to resume sending audio.
     if (_connected && _channel != null) {
-      _channel!.sink.add(jsonEncode({'command': 'resume'}));
+      try {
+        _channel!.sink.add(jsonEncode({'command': 'resume'}));
+      } catch (_) {}
     }
   }
 
