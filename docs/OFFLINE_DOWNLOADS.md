@@ -30,7 +30,7 @@ Downloads run in the background — you can keep reading or browsing.
 
 ## How Downloads Work
 
-The app sends a `play` command with `realtime: false`, which tells the backend to stream audio as fast as synthesis allows (no real-time pacing). After all sentences are synthesised, the backend encodes the complete chapter as FLAC (lossless, typically 3–5× smaller than raw PCM) and sends it in a final binary message. Each downloaded chapter is stored as:
+The app sends a `play` command with `realtime: false`, which tells the backend to stream audio as fast as synthesis allows (no real-time pacing). After all sentences are synthesised, the backend encodes the complete chapter as FLAC (lossless, typically 3–5× smaller than raw PCM) and sends it in a final binary message. The FLAC file is written to storage in 512 KB chunks (to stay within Android's Binder IPC transaction size limit). Each downloaded chapter is stored as:
 
 - `audio.flac` — lossless FLAC audio (24 kHz, mono, PCM16)
 - `meta.json` — paragraph text + sentence timeline for highlight sync

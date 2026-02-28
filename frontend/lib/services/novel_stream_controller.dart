@@ -823,6 +823,21 @@ class NovelStreamController implements ReaderStreamController {
       return;
     }
 
+    // Validate FLAC header: must start with 'fLaC' magic and be >100 bytes.
+    if (flacBytes.length < 100 ||
+        flacBytes[0] != 0x66 || // 'f'
+        flacBytes[1] != 0x4C || // 'L'
+        flacBytes[2] != 0x61 || // 'a'
+        flacBytes[3] != 0x43) { // 'C'
+      _eventsController.add({
+        'type': 'error',
+        'message': 'Downloaded FLAC file is corrupt '
+            '(${flacBytes.length} bytes, header: ${flacBytes.length >= 4 ? flacBytes.sublist(0, 4) : flacBytes}). '
+            'Try re-downloading the chapter.',
+      });
+      return;
+    }
+
     // Ensure SoLoud is initialised.
     if (!_soloudReady) {
       await _soloud.init(sampleRate: sampleRate, channels: Channels.mono);
@@ -837,9 +852,19 @@ class NovelStreamController implements ReaderStreamController {
       try { await _soloud.disposeSource(_audioSource!); } catch (_) {}
     }
 
-    // Load FLAC into SoLoud via loadMem.
-    final src = await _soloud.loadMem('offline_chapter.flac', flacBytes);
-    final handle = await _soloud.play(src);
+    // Load FLAC into SoLoud via loadMem (native dr_flac/libFLAC decoder).
+    final AudioSource src;
+    final SoundHandle handle;
+    try {
+      src = await _soloud.loadMem('offline_chapter.flac', flacBytes);
+      handle = await _soloud.play(src);
+    } catch (e) {
+      _eventsController.add({
+        'type': 'error',
+        'message': 'Failed to decode FLAC audio: $e. Try re-downloading.',
+      });
+      return;
+    }
     _audioSource = src;
     _handle = handle;
     _streamSampleRate = sampleRate;

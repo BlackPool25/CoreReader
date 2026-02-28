@@ -60,10 +60,13 @@ If Web audio still fails with errors like `_createWorkerInWasm` / `SharedArrayBu
 ## Known pitfalls + fixes
 - **Chapter off-by-one**: Novel indexes may include chapter 0/prologue; backend now resolves chapters by parsed chapter number when possible.
 - **Periodic audio gaps**: usually under-buffering. Frontend uses `bufferingTimeNeeds: 1.0` (1 second) for SoLoud buffer.
-- **Audio crackling after long sessions**: Caused by ONNX Runtime session state accumulation. Fixed by periodic session recycling (every ~200 sentences, configurable via `TTS_SESSION_RECYCLE_SENTENCES` env var).
+- **Audio crackling after long sessions**: Caused by ONNX Runtime session state accumulation. Fixed by periodic session recycling (every ~20 sentences, configurable via `TTS_SESSION_RECYCLE_SENTENCES` env var). Uses async overlap: new session is pre-built in a background thread while the current session finishes its prefetch queue — no audible gap.
 - **State resets when switching tabs**: fixed by using `IndexedStack` so Reader isn't disposed.
 - **Double quantisation noise**: Fixed by float32-only pipeline. All audio processing (fade, silence) operates on float32; single int16 conversion at send time.
 - **Downloads storage**: FLAC format (lossless, ~3-5x smaller than raw PCM). Legacy `.pcm` files still supported for playback.
+- **FLAC download truncation on Android**: Android's Binder IPC has a ~1MB transaction limit. FLAC files (typically 3-10MB) are now written in 512KB chunks via SAF to avoid silent truncation.
+- **FLAC playback validation**: Downloaded FLAC files are validated (magic header + minimum size) before loading into SoLoud, with clear error messages if corrupt.
+- **WebSocket concurrent recv race**: The play command's control_task (for pause/stop) is now properly awaited/cancelled before returning to the outer message loop, preventing "cannot call recv while another coroutine is waiting" errors.
 
 ## Files to know
 - Backend:

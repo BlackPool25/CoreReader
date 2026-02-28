@@ -88,13 +88,18 @@ class TTSEngine:
         # session is recreated to avoid accumulated internal state that
         # can introduce subtle audio artifacts (crackling / static).
         self._session_recycle_interval = int(
-            os.getenv("TTS_SESSION_RECYCLE_SENTENCES", "200")
+            os.getenv("TTS_SESSION_RECYCLE_SENTENCES", "20")
         )
         self._sentences_since_recycle = 0
+        # Future holding a pre-created Kokoro instance for seamless swap.
+        self._pending_kokoro: Optional[asyncio.Future] = None
 
         # Dedicated thread-pool for ONNX inference so synthesis doesn't
         # compete with asyncio I/O tasks on the default executor.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
+        # Separate thread-pool for background session creation so it
+        # doesn't block ongoing synthesis in _executor.
+        self._recycle_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-recycle")
 
     def _create_kokoro_instance(self) -> Kokoro:
         """Create a fresh Kokoro instance (rebuilds the ONNX session)."""
@@ -103,12 +108,34 @@ class TTSEngine:
         return Kokoro(self.model_path, self.voices_path)
 
     def _maybe_recycle_session(self) -> None:
-        """Recreate the ONNX session if the sentence threshold is reached."""
+        """Recreate the ONNX session if the sentence threshold is reached.
+
+        Uses async overlap: starts building the new session in a background
+        thread while current synthesis continues using the old session.
+        When the new session is ready, swaps it in atomically.
+        """
         self._sentences_since_recycle += 1
         if self._sentences_since_recycle >= self._session_recycle_interval:
-            logger.info("Recycling ONNX session after %d sentences", self._sentences_since_recycle)
-            self.kokoro = self._create_kokoro_instance()
-            self._sentences_since_recycle = 0
+            if self._pending_kokoro is not None and self._pending_kokoro.done():
+                # New session is ready — swap it in.
+                try:
+                    new_kokoro = self._pending_kokoro.result()
+                    self.kokoro = new_kokoro
+                    logger.info("Swapped in pre-built ONNX session")
+                except Exception as e:
+                    logger.warning("Background session creation failed, rebuilding synchronously: %s", e)
+                    self.kokoro = self._create_kokoro_instance()
+                self._pending_kokoro = None
+                self._sentences_since_recycle = 0
+            elif self._pending_kokoro is None:
+                # Start building new session in background.
+                logger.info("Scheduling background ONNX session recycle after %d sentences", self._sentences_since_recycle)
+                loop = asyncio.get_event_loop()
+                self._pending_kokoro = loop.run_in_executor(
+                    self._recycle_executor, self._create_kokoro_instance
+                )
+                self._sentences_since_recycle = 0
+            # else: pending_kokoro is still building — keep using current session
 
     def list_voices(self) -> List[str]:
         if self._voices_cache is not None:

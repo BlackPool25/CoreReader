@@ -442,7 +442,14 @@ class DownloadsController extends ChangeNotifier {
                   append: false,
                 );
                 if (flacHandle > 0) {
-                  await AndroidSaf.write(flacHandle, bytes);
+                  // Write in 512KB chunks to stay within Android's Binder
+                  // transaction size limit (~1MB). A single large write
+                  // through MethodChannel silently truncates the data.
+                  const chunkSize = 512 * 1024;
+                  for (var offset = 0; offset < bytes.length; offset += chunkSize) {
+                    final end = (offset + chunkSize).clamp(0, bytes.length);
+                    await AndroidSaf.write(flacHandle, bytes.sublist(offset, end));
+                  }
                   await AndroidSaf.closeWrite(flacHandle);
                 }
               }

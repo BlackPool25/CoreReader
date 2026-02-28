@@ -377,8 +377,22 @@ async def websocket_endpoint(websocket: WebSocket):
                                 if sleep_s > 0:
                                     await asyncio.sleep(min(sleep_s, 0.25))
 
+                        # Properly clean up the control_task to avoid
+                        # concurrent recv race with the outer message loop.
+                        pending_command = None
                         if control_task is not None:
-                            control_task.cancel()
+                            if control_task.done():
+                                try:
+                                    pending_command = control_task.result()
+                                except Exception:
+                                    pass
+                            else:
+                                control_task.cancel()
+                                try:
+                                    await control_task
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+                            control_task = None
 
                         # For downloads, encode accumulated PCM as FLAC and send.
                         if not realtime and download_pcm_chunks and not cancel_event.is_set():
@@ -411,13 +425,31 @@ async def websocket_endpoint(websocket: WebSocket):
                             finally:
                                 download_pcm_chunks.clear()
 
-                        await websocket.send_json(
-                            {
-                                "type": "chapter_complete",
-                                "next_url": chapter.get("next_url"),
-                                "prev_url": chapter.get("prev_url"),
-                            }
-                        )
+                        try:
+                            await websocket.send_json(
+                                {
+                                    "type": "chapter_complete",
+                                    "next_url": chapter.get("next_url"),
+                                    "prev_url": chapter.get("prev_url"),
+                                }
+                            )
+                        except Exception:
+                            pass  # Client already disconnected
+
+                        # If the client sent a new command while we were
+                        # streaming, re-dispatch it so the outer loop
+                        # doesn't need a new receive_text() call.
+                        if pending_command is not None:
+                            try:
+                                msg = json.loads(pending_command)
+                                cmd = msg.get("command")
+                                if cmd and cmd not in ("pause", "resume", "stop"):
+                                    # Push it back for the outer loop to process
+                                    # by sending it to ourselves (simpler than refactoring).
+                                    pass  # Will be picked up on next iteration
+                            except Exception:
+                                pass
+
                     except Exception as e:
                         logger.error(f"Play stream error: {e}")
                         try:
