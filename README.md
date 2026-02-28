@@ -12,7 +12,7 @@ CoreReader scrapes light novels from NovelCool and reads them aloud using [Kokor
 
 - **50+ natural English voices** via Kokoro ONNX (CPU, no GPU needed)
 - **Sentence-accurate highlighting** — highlights follow audio playback precisely at any speed
-- **Offline downloads** — download chapters as raw PCM for offline listening (Android)
+- **Offline downloads** — download chapters as lossless FLAC for offline listening (Android)
 - **Two independent speed controls** — TTS render speed (synthesis tempo) + playback speed (fast-forward)
 - **Mihon-style chapter management** — filter, sort, grid/list display, bulk select, mark-as-read
 - **Auto-advance** — automatically moves to the next chapter
@@ -58,7 +58,7 @@ Open **Settings** in the app and paste your backend URL:
 ## How It Works
 
 ```
-┌─────────────┐       WS /ws         ┌──────────────┐
+┌─────────────┐       WS /ws          ┌──────────────┐
 │  Flutter App│ ◄──────────────────► │   Backend    │
 │  (player)   │   PCM16 audio +      │  (FastAPI)   │
 │             │   sentence events    │              │
@@ -84,7 +84,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full data flow and prot
 backend/
   server.py           # FastAPI HTTP + WebSocket server
   scraper.py          # NovelCool chapter scraping
-  tts.py              # Kokoro ONNX TTS engine
+  tts.py              # Kokoro ONNX TTS engine (float32 pipeline, session recycling)
   download_models.py  # Model downloader (kokoro-v1.0.onnx + voices)
 
 frontend/

@@ -83,6 +83,7 @@ class DownloadsController extends ChangeNotifier {
   bool isDownloaded(String novelId, int chapterN) => downloadedChapter(novelId, chapterN) != null;
 
   static List<String> _pcmPath(String novelId, int chapterN) => ['LN-TTS', novelId, 'chapters', '$chapterN', 'audio.pcm'];
+  static List<String> _flacPath(String novelId, int chapterN) => ['LN-TTS', novelId, 'chapters', '$chapterN', 'audio.flac'];
   static List<String> _metaPath(String novelId, int chapterN) => ['LN-TTS', novelId, 'chapters', '$chapterN', 'meta.json'];
   static List<String> _chaptersDir(String novelId) => ['LN-TTS', novelId, 'chapters'];
 
@@ -110,17 +111,20 @@ class DownloadsController extends ChangeNotifier {
       final n = int.tryParse(name);
       if (n == null || n <= 0) continue;
       final pcmPath = _pcmPath(novelId, n);
+      final flacPath = _flacPath(novelId, n);
       final metaPath = _metaPath(novelId, n);
       bool hasPcm = false;
+      bool hasFlac = false;
       bool hasMeta = false;
       try {
         hasPcm = await AndroidSaf.exists(treeUri: t, pathSegments: pcmPath);
+        hasFlac = await AndroidSaf.exists(treeUri: t, pathSegments: flacPath);
         hasMeta = await AndroidSaf.exists(treeUri: t, pathSegments: metaPath);
       } catch (_) {
         continue;
       }
 
-      if (hasPcm && hasMeta) {
+      if ((hasPcm || hasFlac) && hasMeta) {
         final meta = await _loadMetaAtPath(treeUri: t, metaPath: metaPath);
         // Ignore incomplete downloads (keep on disk; do not surface as downloaded).
         if (meta != null && meta.complete == false) {
@@ -131,6 +135,9 @@ class DownloadsController extends ChangeNotifier {
         final voice = meta?.voice ?? 'af_bella';
         final ttsSpeed = meta?.ttsSpeed ?? 1.0;
         final source = meta?.source ?? 'manual';
+        final audioFormat = meta?.audioFormat ?? (hasFlac ? 'flac' : 'pcm');
+        // Prefer FLAC path if it exists.
+        final effectiveAudioPath = hasFlac ? flacPath : pcmPath;
         scanned[n] = DownloadedChapter(
           novelId: novelId,
           chapterN: n,
@@ -141,8 +148,9 @@ class DownloadsController extends ChangeNotifier {
           voice: voice,
           ttsSpeed: ttsSpeed,
           source: source,
-          pcmPath: pcmPath,
+          pcmPath: effectiveAudioPath,
           metaPath: metaPath,
+          audioFormat: audioFormat,
         );
       } else {
         // Incomplete chapter on disk.
@@ -193,12 +201,13 @@ class DownloadsController extends ChangeNotifier {
   Future<void> deleteDownloadedChapter({required String treeUri, required String novelId, required int chapterN}) async {
     final existing = downloadedChapter(novelId, chapterN);
     if (existing != null) {
-      await AndroidSaf.delete(treeUri: treeUri, pathSegments: existing.pcmPath);
-      await AndroidSaf.delete(treeUri: treeUri, pathSegments: existing.metaPath);
-    } else {
-      await AndroidSaf.delete(treeUri: treeUri, pathSegments: _pcmPath(novelId, chapterN));
-      await AndroidSaf.delete(treeUri: treeUri, pathSegments: _metaPath(novelId, chapterN));
+      try { await AndroidSaf.delete(treeUri: treeUri, pathSegments: existing.pcmPath); } catch (_) {}
+      try { await AndroidSaf.delete(treeUri: treeUri, pathSegments: existing.metaPath); } catch (_) {}
     }
+    // Also try deleting both .pcm and .flac variants to clean up fully.
+    try { await AndroidSaf.delete(treeUri: treeUri, pathSegments: _pcmPath(novelId, chapterN)); } catch (_) {}
+    try { await AndroidSaf.delete(treeUri: treeUri, pathSegments: _flacPath(novelId, chapterN)); } catch (_) {}
+    try { await AndroidSaf.delete(treeUri: treeUri, pathSegments: _metaPath(novelId, chapterN)); } catch (_) {}
 
     final list = [...(_index[novelId] ?? const <DownloadedChapter>[])];
     list.removeWhere((c) => c.chapterN == chapterN);
@@ -220,6 +229,15 @@ class DownloadsController extends ChangeNotifier {
         await AndroidSaf.delete(treeUri: treeUri, pathSegments: c.metaPath);
       } catch (_) {}
     }
+    // Also clean up any .pcm/.flac variants not referenced by the index.
+    for (final c in list) {
+      try {
+        await AndroidSaf.delete(treeUri: treeUri, pathSegments: _pcmPath(novelId, c.chapterN));
+      } catch (_) {}
+      try {
+        await AndroidSaf.delete(treeUri: treeUri, pathSegments: _flacPath(novelId, c.chapterN));
+      } catch (_) {}
+    }
     _index = {
       ..._index,
       novelId: const <DownloadedChapter>[],
@@ -229,6 +247,7 @@ class DownloadsController extends ChangeNotifier {
   }
 
   /// Download a chapter using backend WS play (realtime=false) and save PCM+meta.
+  /// If the backend sends a FLAC-encoded version, it will be saved as .flac instead.
   Future<DownloadedChapter> downloadChapter({
     required String treeUri,
     required String novelId,
@@ -244,12 +263,16 @@ class DownloadsController extends ChangeNotifier {
     if (treeUri.trim().isEmpty) throw Exception('Downloads folder not set');
 
     final pcmPath = _pcmPath(novelId, chapterN);
+    final flacPath = _flacPath(novelId, chapterN);
     final metaPath = _metaPath(novelId, chapterN);
 
     // Ensure we start from a clean slate (some SAF providers may not truncate
     // reliably on overwrite, which can sound like jitter/corruption).
     try {
       await AndroidSaf.delete(treeUri: treeUri, pathSegments: pcmPath);
+    } catch (_) {}
+    try {
+      await AndroidSaf.delete(treeUri: treeUri, pathSegments: flacPath);
     } catch (_) {}
     try {
       await AndroidSaf.delete(treeUri: treeUri, pathSegments: metaPath);
@@ -304,6 +327,12 @@ class DownloadsController extends ChangeNotifier {
 
     var sentenceTotal = 0;
     var sentencesSeen = 0;
+
+    // FLAC download state: when backend sends flac_data event followed by
+    // FLAC binary, we save it as the final audio file.
+    var awaitingFlacBinary = false;
+    var flacEncoding = '';
+    var receivedFlac = false;
 
     try {
       final base = await SettingsStore.getServerBaseUrl();
@@ -376,6 +405,10 @@ class DownloadsController extends ChangeNotifier {
                   }
                   notifyListeners();
                 }
+              } else if (type == 'flac_data') {
+                // Backend is about to send FLAC-encoded audio as the next binary message.
+                awaitingFlacBinary = true;
+                flacEncoding = (obj['encoding'] as String?) ?? 'flac';
               } else if (type == 'chapter_complete') {
                 // Wait for all queued PCM writes to finish before signaling
                 // completion; otherwise the file may be truncated.
@@ -392,10 +425,30 @@ class DownloadsController extends ChangeNotifier {
             return;
           }
 
-          // Binary audio frame.
+          // Binary audio frame (or FLAC blob if awaitingFlacBinary).
           writeChain = writeChain.then((_) async {
             final bytes = await wsBinaryToBytes(event);
             if (bytes == null || bytes.isEmpty) return;
+
+            if (awaitingFlacBinary) {
+              // This binary is the complete FLAC file from the backend.
+              awaitingFlacBinary = false;
+              if (flacEncoding == 'flac') {
+                receivedFlac = true;
+                final flacHandle = await AndroidSaf.openWrite(
+                  treeUri: treeUri,
+                  pathSegments: flacPath,
+                  mimeType: 'audio/flac',
+                  append: false,
+                );
+                if (flacHandle > 0) {
+                  await AndroidSaf.write(flacHandle, bytes);
+                  await AndroidSaf.closeWrite(flacHandle);
+                }
+              }
+              return;
+            }
+
             var chunk = bytes;
 
             // Ensure PCM16 alignment (2 bytes/sample). If a chunk boundary splits
@@ -440,6 +493,19 @@ class DownloadsController extends ChangeNotifier {
         pendingByte = null;
       }
 
+      final audioFormat = receivedFlac ? 'flac' : 'pcm';
+      final audioPath = receivedFlac ? flacPath : pcmPath;
+
+      // If we got FLAC, delete the fallback PCM file to save space.
+      if (receivedFlac) {
+        try {
+          await AndroidSaf.closeWrite(pcmHandle);
+        } catch (_) {}
+        try {
+          await AndroidSaf.delete(treeUri: treeUri, pathSegments: pcmPath);
+        } catch (_) {}
+      }
+
       final meta = DownloadedChapterMeta(
         title: title,
         url: chapterUrl,
@@ -448,6 +514,7 @@ class DownloadsController extends ChangeNotifier {
         ttsSpeed: speed,
         complete: true,
         source: source,
+        audioFormat: audioFormat,
         paragraphs: paragraphs,
         timeline: timeline,
       );
@@ -472,8 +539,9 @@ class DownloadsController extends ChangeNotifier {
         voice: effectiveVoice,
         ttsSpeed: speed,
         source: source,
-        pcmPath: pcmPath,
+        pcmPath: audioPath,
         metaPath: metaPath,
+        audioFormat: audioFormat,
       );
 
       final list = [...(_index[novelId] ?? const <DownloadedChapter>[])];
@@ -488,9 +556,11 @@ class DownloadsController extends ChangeNotifier {
       notifyListeners();
       return chapter;
     } finally {
-      try {
-        await AndroidSaf.closeWrite(pcmHandle);
-      } catch (_) {}
+      if (!receivedFlac) {
+        try {
+          await AndroidSaf.closeWrite(pcmHandle);
+        } catch (_) {}
+      }
       try {
         await channel?.sink.close();
       } catch (_) {}

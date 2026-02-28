@@ -86,6 +86,22 @@
 }
 ```
 
+**`flac_data`** (downloads only) — sent before `chapter_complete` when `realtime: false`:
+
+```json
+{
+  "type": "flac_data",
+  "size": 1234567,
+  "sample_rate": 24000,
+  "channels": 1
+}
+```
+
+The next binary WebSocket message after `flac_data` contains the complete FLAC
+file. The client saves this instead of the raw PCM chunks for better compression
+and lossless storage.
+```
+
 ## Speed Controls
 
 The app has **two independent speed controls**:
@@ -108,9 +124,18 @@ Each `sentence` event includes `char_start` and `char_end` (character offsets wi
 ## Audio Pacing
 
 - **Live streaming** (`realtime: true`, default): Backend paces output to roughly match playback time, reducing client buffer bloat. A small lookahead (~100ms) avoids stutter.
-- **Offline downloads** (`realtime: false`): Backend sends as fast as synthesis allows. The app writes chunks to disk as they arrive.
+- **Offline downloads** (`realtime: false`): Backend sends as fast as synthesis allows. The app writes chunks to disk as they arrive. After all sentences, the backend sends a FLAC-encoded copy of the complete chapter for lossless storage.
 
 Audio chunking is sentence-based, so if buffering causes a pause, it happens **between** sentences rather than mid-word.
+
+## Audio Quality
+
+The synthesis pipeline is designed to minimise artefacts:
+
+- **Float32 pipeline**: All audio processing (fade, silence padding) operates on float32. A single float32→int16 conversion happens at the very end, right before sending over WebSocket. This eliminates double-quantisation noise.
+- **Raised-cosine fade**: Sentence boundaries use a smooth cosine fade-in/out instead of linear, producing imperceptible transitions.
+- **Session recycling**: The ONNX Runtime session is recreated every ~200 sentences to prevent numerical drift from accumulated internal state.
+- **Dedicated TTS thread**: Kokoro inference runs on a dedicated `ThreadPoolExecutor(max_workers=1)` to avoid contention with I/O tasks.
 
 ---
 

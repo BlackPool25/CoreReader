@@ -1,6 +1,6 @@
 # Offline Downloads (Android)
 
-Offline downloads use the Android **Storage Access Framework (SAF)** to store chapters as raw PCM audio files.
+Offline downloads use the Android **Storage Access Framework (SAF)** to store chapters as lossless **FLAC** audio files.
 
 ---
 
@@ -30,10 +30,12 @@ Downloads run in the background — you can keep reading or browsing.
 
 ## How Downloads Work
 
-The app sends a `play` command with `realtime: false`, which tells the backend to stream audio as fast as synthesis allows (no real-time pacing). Each downloaded chapter is stored as:
+The app sends a `play` command with `realtime: false`, which tells the backend to stream audio as fast as synthesis allows (no real-time pacing). After all sentences are synthesised, the backend encodes the complete chapter as FLAC (lossless, typically 3–5× smaller than raw PCM) and sends it in a final binary message. Each downloaded chapter is stored as:
 
-- `audio.pcm` — raw PCM16 mono audio
+- `audio.flac` — lossless FLAC audio (24 kHz, mono, PCM16)
 - `meta.json` — paragraph text + sentence timeline for highlight sync
+
+> **Legacy**: Chapters downloaded before the FLAC update may still have `audio.pcm`. The app handles both formats transparently.
 
 ---
 
@@ -45,7 +47,7 @@ The app sends a `play` command with `realtime: false`, which tells the backend t
     app_state/         # Library, chapter cache, reading progress, downloads index
     <novel-id>/
       <chapter-n>/
-        audio.pcm
+        audio.flac     # (or audio.pcm for legacy downloads)
         meta.json
 ```
 

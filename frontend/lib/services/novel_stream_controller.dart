@@ -130,6 +130,7 @@ class NovelStreamController implements ReaderStreamController {
   Timer? _offlineTimelineTimer;
   int? _offlineReadHandle;
   bool _offlineActive = false;
+  bool _offlineFlacMode = false;
   List<Map<String, dynamic>> _offlineTimeline = const [];
   int _offlineTimelineIdx = 0;
   int _offlineStartMs = 0;
@@ -305,7 +306,7 @@ class NovelStreamController implements ReaderStreamController {
       channels: Channels.mono,
       format: BufferType.s16le,
       bufferingType: BufferingType.released,
-      bufferingTimeNeeds: 0.20,
+      bufferingTimeNeeds: 1.0,
       maxBufferSizeDuration: const Duration(minutes: 30),
     );
     final handle = await _soloud.play(src);
@@ -661,6 +662,21 @@ class NovelStreamController implements ReaderStreamController {
       },
     });
 
+    final audioFormat = (metaJson['audioFormat'] as String?) ?? 'pcm';
+    _offlineFlacMode = audioFormat == 'flac';
+
+    if (_offlineFlacMode) {
+      await _playDownloadedFlac(
+        treeUri: treeUri,
+        audioPath: pcmPath,
+        sampleRate: sampleRate,
+        playbackSpeed: playbackSpeed,
+      );
+      return;
+    }
+
+    // ---------- PCM buffer-stream path ----------
+    _offlineFlacMode = false;
     await _ensureAudioStream(sampleRate);
 
     // Apply the playback speed multiplier for the offline chapter.
@@ -676,36 +692,7 @@ class NovelStreamController implements ReaderStreamController {
     }
 
     // Drive highlights via our wall-clock playback timer.
-    _offlineTimelineTimer?.cancel();
-    _offlineTimelineTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
-      if (!_offlineActive || _audioSource == null) return;
-      try {
-        final elapsedMs = _playbackElapsedMs();
-        final sr = _streamSampleRate ?? sampleRate;
-        final maxPlayableMs = _offlineStartMs + (((_offlineEnqueuedSamples * 1000) / sr).floor());
-        final rawT = elapsedMs + _offlineStartMs;
-        final t = rawT <= maxPlayableMs ? rawT : maxPlayableMs;
-        while (_offlineTimelineIdx < _offlineTimeline.length) {
-          final item = _offlineTimeline[_offlineTimelineIdx];
-          final ms = (item['ms'] as num?)?.toInt() ?? 0;
-          if (ms > t) break;
-          _offlineTimelineIdx++;
-          _eventsController.add({
-            'type': 'sentence',
-            'text': (item['text'] as String?) ?? '',
-            'paragraph_index': (item['p'] as num?)?.toInt() ?? 0,
-            'sentence_index': (item['s'] as num?)?.toInt() ?? 0,
-            if (item['cs'] != null) 'char_start': (item['cs'] as num?)?.toInt() ?? 0,
-            if (item['ce'] != null) 'char_end': (item['ce'] as num?)?.toInt() ?? 0,
-          });
-          // Track last-heard paragraph for offline playback too.
-          final pIdxOff = (item['p'] as num?)?.toInt();
-          if (pIdxOff != null) _lastHeardParagraphIndex = pIdxOff;
-        }
-      } catch (_) {
-        // ignore
-      }
-    });
+    _startOfflineTimeline(sampleRate);
 
     // Stream PCM from SAF into SoLoud buffer.
     final handle = await AndroidSaf.openRead(treeUri: treeUri, pathSegments: pcmPath);
@@ -805,6 +792,130 @@ class NovelStreamController implements ReaderStreamController {
     }
   }
 
+  /// Play a downloaded FLAC file using SoLoud's native decoding.
+  Future<void> _playDownloadedFlac({
+    required String treeUri,
+    required List<String> audioPath,
+    required int sampleRate,
+    required double playbackSpeed,
+  }) async {
+    // Read the entire FLAC file from SAF into memory.
+    final flacHandle = await AndroidSaf.openRead(treeUri: treeUri, pathSegments: audioPath);
+    if (flacHandle <= 0) {
+      _eventsController.add({'type': 'error', 'message': 'Failed to open downloaded FLAC audio'});
+      return;
+    }
+
+    final builder = BytesBuilder(copy: false);
+    try {
+      while (true) {
+        final chunk = await AndroidSaf.read(flacHandle, maxBytes: 256 * 1024);
+        if (chunk == null || chunk.isEmpty) break;
+        builder.add(chunk);
+      }
+    } finally {
+      try { await AndroidSaf.closeRead(flacHandle); } catch (_) {}
+    }
+
+    final flacBytes = builder.toBytes();
+    if (flacBytes.isEmpty) {
+      _eventsController.add({'type': 'error', 'message': 'Downloaded FLAC file is empty'});
+      return;
+    }
+
+    // Ensure SoLoud is initialised.
+    if (!_soloudReady) {
+      await _soloud.init(sampleRate: sampleRate, channels: Channels.mono);
+      _soloudReady = true;
+    }
+
+    // Dispose any previous source/handle.
+    if (_handle != null) {
+      try { await _soloud.stop(_handle!); } catch (_) {}
+    }
+    if (_audioSource != null) {
+      try { await _soloud.disposeSource(_audioSource!); } catch (_) {}
+    }
+
+    // Load FLAC into SoLoud via loadMem.
+    final src = await _soloud.loadMem('offline_chapter.flac', flacBytes);
+    final handle = await _soloud.play(src);
+    _audioSource = src;
+    _handle = handle;
+    _streamSampleRate = sampleRate;
+
+    // Seek to the start paragraph offset.
+    if (_offlineStartMs > 0) {
+      _soloud.seek(handle, Duration(milliseconds: _offlineStartMs));
+    }
+
+    // Apply playback speed.
+    if ((playbackSpeed - 1.0).abs() > 0.001) {
+      try {
+        _soloud.setRelativePlaySpeed(handle, playbackSpeed);
+        _playbackSpeedMultiplier = playbackSpeed;
+      } catch (_) {}
+    }
+
+    // The clock is not used for FLAC mode — getPosition() is authoritative.
+    _clockStarted = true;
+
+    // Drive highlights via SoLoud's getPosition.
+    _startOfflineTimeline(sampleRate);
+
+    // Wait for playback to finish.
+    try {
+      while (_offlineActive && _handle != null && _soloud.getIsValidVoiceHandle(_handle!)) {
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+      }
+      if (_offlineActive) {
+        _eventsController.add({'type': 'chapter_complete', 'next_url': null, 'prev_url': null});
+      }
+    } catch (e) {
+      _eventsController.add({'type': 'error', 'message': e.toString()});
+    }
+  }
+
+  /// Start (or restart) the periodic timer that drives offline highlight events.
+  void _startOfflineTimeline(int sampleRate) {
+    _offlineTimelineTimer?.cancel();
+    _offlineTimelineTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
+      if (!_offlineActive || _handle == null) return;
+      try {
+        int t;
+        if (_offlineFlacMode) {
+          // FLAC: SoLoud natively tracks position.
+          t = _soloud.getPosition(_handle!).inMilliseconds;
+        } else {
+          // PCM buffer-stream: use wall-clock timer.
+          final elapsedMs = _playbackElapsedMs();
+          final sr = _streamSampleRate ?? sampleRate;
+          final maxPlayableMs = _offlineStartMs + (((_offlineEnqueuedSamples * 1000) / sr).floor());
+          final rawT = elapsedMs + _offlineStartMs;
+          t = rawT <= maxPlayableMs ? rawT : maxPlayableMs;
+        }
+        while (_offlineTimelineIdx < _offlineTimeline.length) {
+          final item = _offlineTimeline[_offlineTimelineIdx];
+          final ms = (item['ms'] as num?)?.toInt() ?? 0;
+          if (ms > t) break;
+          _offlineTimelineIdx++;
+          _eventsController.add({
+            'type': 'sentence',
+            'text': (item['text'] as String?) ?? '',
+            'paragraph_index': (item['p'] as num?)?.toInt() ?? 0,
+            'sentence_index': (item['s'] as num?)?.toInt() ?? 0,
+            if (item['cs'] != null) 'char_start': (item['cs'] as num?)?.toInt() ?? 0,
+            if (item['ce'] != null) 'char_end': (item['ce'] as num?)?.toInt() ?? 0,
+          });
+          final pIdxOff = (item['p'] as num?)?.toInt();
+          if (pIdxOff != null) _lastHeardParagraphIndex = pIdxOff;
+        }
+      } catch (_) {
+        // ignore
+      }
+    });
+  }
+
   @override
   Future<void> setPlaybackSpeed(double speed) async {
     // Snapshot the effective elapsed time before changing the multiplier.
@@ -872,33 +983,7 @@ class NovelStreamController implements ReaderStreamController {
     }
     // Offline timeline timer is restarted only if offline playback is active.
     if (_offlineActive && _offlineTimeline.isNotEmpty) {
-      _offlineTimelineTimer?.cancel();
-      _offlineTimelineTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
-        if (!_offlineActive || _audioSource == null) return;
-        try {
-          final elapsedMs = _playbackElapsedMs();
-          final sr = _streamSampleRate ?? 24000;
-          final maxPlayableMs = _offlineStartMs + (((_offlineEnqueuedSamples * 1000) / sr).floor());
-          final rawT = elapsedMs + _offlineStartMs;
-          final t = rawT <= maxPlayableMs ? rawT : maxPlayableMs;
-          while (_offlineTimelineIdx < _offlineTimeline.length) {
-            final item = _offlineTimeline[_offlineTimelineIdx];
-            final ms = (item['ms'] as num?)?.toInt() ?? 0;
-            if (ms > t) break;
-            _offlineTimelineIdx++;
-            _eventsController.add({
-              'type': 'sentence',
-              'text': (item['text'] as String?) ?? '',
-              'paragraph_index': (item['p'] as num?)?.toInt() ?? 0,
-              'sentence_index': (item['s'] as num?)?.toInt() ?? 0,
-              if (item['cs'] != null) 'char_start': (item['cs'] as num?)?.toInt() ?? 0,
-              if (item['ce'] != null) 'char_end': (item['ce'] as num?)?.toInt() ?? 0,
-            });
-            final pIdxOff = (item['p'] as num?)?.toInt();
-            if (pIdxOff != null) _lastHeardParagraphIndex = pIdxOff;
-          }
-        } catch (_) {}
-      });
+      _startOfflineTimeline(_streamSampleRate ?? 24000);
     }
 
     // Tell the backend to resume sending audio.
@@ -919,6 +1004,7 @@ class NovelStreamController implements ReaderStreamController {
     _remoteChapterComplete = false;
     _stopLiveTimeline();
     _offlineActive = false;
+    _offlineFlacMode = false;
     _offlineTimelineTimer?.cancel();
     _offlineTimelineTimer = null;
     if (_offlineReadHandle != null) {

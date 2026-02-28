@@ -6,10 +6,14 @@ from kokoro_onnx import Kokoro
 import asyncio
 import json
 import inspect
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator, Iterable, List, Optional
 import contextlib
 from pathlib import Path
 import zipfile
+
+logger = logging.getLogger(__name__)
 
 class TTSEngine:
     def __init__(
@@ -67,21 +71,44 @@ class TTSEngine:
             sess_options = None
 
         # kokoro_onnx API varies by version; try passing providers if supported.
-        kokoro_sig = inspect.signature(Kokoro)
-        kokoro_kwargs = {}
-        if "providers" in kokoro_sig.parameters:
-            kokoro_kwargs["providers"] = self.providers
+        self._kokoro_sig = inspect.signature(Kokoro)
+        self._kokoro_kwargs: dict = {}
+        if "providers" in self._kokoro_sig.parameters:
+            self._kokoro_kwargs["providers"] = self.providers
         # Newer versions may support passing ORT session options.
         if sess_options is not None:
             for k in ("sess_options", "session_options", "ort_session_options"):
-                if k in kokoro_sig.parameters:
-                    kokoro_kwargs[k] = sess_options
+                if k in self._kokoro_sig.parameters:
+                    self._kokoro_kwargs[k] = sess_options
                     break
 
-        if kokoro_kwargs:
-            self.kokoro = Kokoro(self.model_path, self.voices_path, **kokoro_kwargs)
-        else:
-            self.kokoro = Kokoro(self.model_path, self.voices_path)
+        self.kokoro = self._create_kokoro_instance()
+
+        # Periodic session recycling: after this many sentences the ONNX
+        # session is recreated to avoid accumulated internal state that
+        # can introduce subtle audio artifacts (crackling / static).
+        self._session_recycle_interval = int(
+            os.getenv("TTS_SESSION_RECYCLE_SENTENCES", "200")
+        )
+        self._sentences_since_recycle = 0
+
+        # Dedicated thread-pool for ONNX inference so synthesis doesn't
+        # compete with asyncio I/O tasks on the default executor.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
+
+    def _create_kokoro_instance(self) -> Kokoro:
+        """Create a fresh Kokoro instance (rebuilds the ONNX session)."""
+        if self._kokoro_kwargs:
+            return Kokoro(self.model_path, self.voices_path, **self._kokoro_kwargs)
+        return Kokoro(self.model_path, self.voices_path)
+
+    def _maybe_recycle_session(self) -> None:
+        """Recreate the ONNX session if the sentence threshold is reached."""
+        self._sentences_since_recycle += 1
+        if self._sentences_since_recycle >= self._session_recycle_interval:
+            logger.info("Recycling ONNX session after %d sentences", self._sentences_since_recycle)
+            self.kokoro = self._create_kokoro_instance()
+            self._sentences_since_recycle = 0
 
     def list_voices(self) -> List[str]:
         if self._voices_cache is not None:
@@ -238,42 +265,52 @@ class TTSEngine:
         for i in range(0, len(pcm16), frame_bytes):
             yield pcm16[i : i + frame_bytes]
 
-    def _apply_edge_fade_pcm16(self, pcm16: bytes, *, fade_ms: int = 6) -> bytes:
-        """Apply a short fade-in/out to reduce boundary clicks.
+    def _apply_cosine_fade_f32(self, audio: np.ndarray, *, fade_ms: int = 6) -> np.ndarray:
+        """Apply a raised-cosine fade-in/out on float32 audio.
 
-        Kokoro is synthesized per sentence, so concatenation (or appending silence)
-        can produce discontinuities. A tiny edge fade is a minimal, cheap fix.
+        Operates entirely in float32 to avoid quantization round-trips.
+        A cosine curve is smoother than linear and eliminates audible clicks
+        at sentence boundaries.
         """
-        if not pcm16 or fade_ms <= 0:
-            return pcm16
-
-        samples = np.frombuffer(pcm16, dtype=np.int16)
-        n = int(samples.shape[0])
-        if n < 8:
-            return pcm16
+        if audio.size < 8 or fade_ms <= 0:
+            return audio
 
         fade_samples = int(self.sample_rate * (float(fade_ms) / 1000.0))
-        fade_samples = max(0, min(fade_samples, n // 2))
+        fade_samples = max(0, min(fade_samples, audio.size // 2))
         if fade_samples < 2:
-            return pcm16
+            return audio
 
-        # Work in float for clean scaling then back to int16.
-        x = samples.astype(np.float32)
-        ramp = np.linspace(0.0, 1.0, fade_samples, endpoint=False, dtype=np.float32)
-        x[:fade_samples] *= ramp
-        x[-fade_samples:] *= ramp[::-1]
-        x = np.clip(x, -32768.0, 32767.0)
-        return x.astype(np.int16).tobytes()
+        # Raised-cosine: 0.5 * (1 - cos(pi * t)) for t in [0, 1]
+        t = np.linspace(0.0, 1.0, fade_samples, endpoint=False, dtype=np.float32)
+        ramp = 0.5 * (1.0 - np.cos(np.pi * t))
+        audio = audio.copy()
+        audio[:fade_samples] *= ramp
+        audio[-fade_samples:] *= ramp[::-1]
+        return audio
+
+    @staticmethod
+    def _float32_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+        """Single float32 -> int16 conversion. Called once at the end of the pipeline."""
+        return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+    async def synthesize_sentence_f32(self, sentence: str, voice: str, speed: float) -> np.ndarray:
+        """Synthesize a sentence and return float32 audio (no quantization yet)."""
+        loop = asyncio.get_running_loop()
+        audio, _ = await loop.run_in_executor(
+            self._executor, self.kokoro.create, sentence, voice, speed
+        )
+        self._maybe_recycle_session()
+        return np.asarray(audio, dtype=np.float32)
 
     async def synthesize_sentence_pcm16(self, sentence: str, voice: str, speed: float) -> bytes:
-        loop = asyncio.get_running_loop()
-        audio, _ = await loop.run_in_executor(None, self.kokoro.create, sentence, voice, speed)
-        audio_int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
-        return audio_int16.tobytes()
+        """Backward-compatible: returns PCM16 bytes."""
+        audio = await self.synthesize_sentence_f32(sentence, voice=voice, speed=speed)
+        return self._float32_to_pcm16_bytes(audio)
 
     async def synthesize_sentence_pcm16_smoothed(self, sentence: str, voice: str, speed: float) -> bytes:
-        pcm16 = await self.synthesize_sentence_pcm16(sentence, voice=voice, speed=speed)
-        return self._apply_edge_fade_pcm16(pcm16)
+        audio = await self.synthesize_sentence_f32(sentence, voice=voice, speed=speed)
+        audio = self._apply_cosine_fade_f32(audio)
+        return self._float32_to_pcm16_bytes(audio)
 
     async def generate_audio_stream(
         self,
@@ -320,7 +357,7 @@ class TTSEngine:
                     yield (sentence, frame)
         finally:
             producer_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BaseException):
                 await producer_task
 
     async def generate_audio_stream_paragraphs(
@@ -399,7 +436,7 @@ class TTSEngine:
                         yield (p_idx, s_idx, sentence, frame)
         finally:
             producer_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BaseException):
                 await producer_task
 
     async def generate_audio_stream_paragraphs_sentence_chunks(
@@ -429,7 +466,7 @@ class TTSEngine:
         """
 
         segments = self.split_paragraphs_with_offsets(paragraphs)
-        queue: asyncio.Queue[Optional[tuple[int, int, str, bytes, int, int, int]]] = asyncio.Queue(
+        queue: asyncio.Queue[Optional[tuple[int, int, str, bytes, int, int]]] = asyncio.Queue(
             maxsize=max(1, prefetch_sentences)
         )
 
@@ -453,11 +490,20 @@ class TTSEngine:
                         break
                     if not s:
                         continue
-                    pcm16 = await self.synthesize_sentence_pcm16(s, voice=voice, speed=speed)
+                    # Stay in float32 for all processing; convert once at the end.
+                    audio_f32 = await self.synthesize_sentence_f32(s, voice=voice, speed=speed)
                     if fade_ms and fade_ms > 0:
-                        pcm16 = self._apply_edge_fade_pcm16(pcm16, fade_ms=int(fade_ms))
+                        audio_f32 = self._apply_cosine_fade_f32(audio_f32, fade_ms=int(fade_ms))
                     pause_ms = pause_ms_for(s, is_last)
-                    await queue.put((p_idx, s_idx, s, pcm16, pause_ms, int(cs), int(ce)))
+
+                    # Append silence in float32 then convert the whole chunk once.
+                    if pause_ms > 0:
+                        silence_samples = int(self.sample_rate * (pause_ms / 1000.0))
+                        silence = np.zeros(silence_samples, dtype=np.float32)
+                        audio_f32 = np.concatenate([audio_f32, silence])
+
+                    pcm16 = self._float32_to_pcm16_bytes(audio_f32)
+                    await queue.put((p_idx, s_idx, s, pcm16, int(cs), int(ce)))
             finally:
                 await queue.put(None)
 
@@ -467,21 +513,36 @@ class TTSEngine:
                 item = await queue.get()
                 if item is None:
                     break
-                p_idx, s_idx, sentence, pcm16, pause_ms, cs, ce = item
+                p_idx, s_idx, sentence, pcm16, cs, ce = item
                 if cancel_event is not None and cancel_event.is_set():
                     return
 
-                if pause_ms > 0:
-                    silence_samples = int(self.sample_rate * (pause_ms / 1000.0))
-                    silence_bytes = silence_samples * 2
-                    chunk = pcm16 + (b"\x00" * silence_bytes)
-                else:
-                    chunk = pcm16
-                yield (p_idx, s_idx, sentence, chunk, cs, ce)
+                yield (p_idx, s_idx, sentence, pcm16, cs, ce)
         finally:
             producer_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BaseException):
                 await producer_task
+
+    @staticmethod
+    def encode_pcm16_to_flac(pcm16_bytes: bytes, sample_rate: int = 24000) -> bytes:
+        """Encode raw PCM16 mono bytes to FLAC (lossless compression).
+
+        Uses soundfile for maximum portability (pip-installable, no external
+        binary deps). Falls back to returning the original PCM if soundfile
+        is not available.
+        """
+        try:
+            import soundfile as sf
+            import io
+
+            samples = np.frombuffer(pcm16_bytes, dtype=np.int16)
+            # soundfile expects float or int data; int16 is supported natively.
+            buf = io.BytesIO()
+            sf.write(buf, samples, sample_rate, format="FLAC", subtype="PCM_16")
+            return buf.getvalue()
+        except ImportError:
+            logger.warning("soundfile not installed; returning raw PCM instead of FLAC")
+            return pcm16_bytes
 
 if __name__ == "__main__":
     # Test

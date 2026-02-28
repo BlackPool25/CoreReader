@@ -11,6 +11,7 @@ class DownloadedChapter {
     required this.source,
     required this.pcmPath,
     required this.metaPath,
+    this.audioFormat = 'pcm',
   });
 
   final String novelId;
@@ -28,8 +29,12 @@ class DownloadedChapter {
   /// - auto: queued by auto-download
   final String source;
 
+  /// Audio format: 'pcm' (raw PCM16) or 'flac' (lossless compressed).
+  final String audioFormat;
+
   /// Storage-relative path segments under the configured downloads root.
   /// Example: ["LN-TTS", novelId, "chapters", "12", "audio.pcm"]
+  /// or ["LN-TTS", novelId, "chapters", "12", "audio.flac"]
   final List<String> pcmPath;
 
   /// Example: ["LN-TTS", novelId, "chapters", "12", "meta.json"]
@@ -45,6 +50,7 @@ class DownloadedChapter {
         'voice': voice,
         'ttsSpeed': ttsSpeed,
         'source': source,
+        'audioFormat': audioFormat,
         'pcmPath': pcmPath,
         'metaPath': metaPath,
       };
@@ -62,6 +68,7 @@ class DownloadedChapter {
       voice: (json['voice'] as String?) ?? '',
       ttsSpeed: (json['ttsSpeed'] as num?)?.toDouble() ?? 1.0,
       source: (json['source'] as String?) ?? 'manual',
+      audioFormat: (json['audioFormat'] as String?) ?? 'pcm',
       pcmPath: pcm,
       metaPath: meta,
     );
@@ -117,6 +124,7 @@ class DownloadedChapterMeta {
     required this.source,
     required this.paragraphs,
     required this.timeline,
+    this.audioFormat = 'pcm',
   });
 
   final String title;
@@ -126,6 +134,7 @@ class DownloadedChapterMeta {
   final double ttsSpeed;
   final bool complete;
   final String source;
+  final String audioFormat;
   final List<String> paragraphs;
   final List<ChapterTimelineItem> timeline;
 
@@ -138,6 +147,7 @@ class DownloadedChapterMeta {
         'ttsSpeed': ttsSpeed,
       'complete': complete,
       'source': source,
+      'audioFormat': audioFormat,
         'paragraphs': paragraphs,
         'timeline': timeline.map((e) => e.toJson()).toList(growable: false),
       };
@@ -163,6 +173,7 @@ class DownloadedChapterMeta {
       ttsSpeed: (json['ttsSpeed'] as num?)?.toDouble() ?? 1.0,
       complete: (json['complete'] as bool?) ?? true,
       source: (json['source'] as String?) ?? 'manual',
+      audioFormat: (json['audioFormat'] as String?) ?? 'pcm',
       paragraphs: paras,
       timeline: timeline,
     );

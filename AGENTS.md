@@ -59,21 +59,23 @@ If Web audio still fails with errors like `_createWorkerInWasm` / `SharedArrayBu
 
 ## Known pitfalls + fixes
 - **Chapter off-by-one**: Novel indexes may include chapter 0/prologue; backend now resolves chapters by parsed chapter number when possible.
-- **Periodic audio gaps**: usually under-buffering. Frontend increases:
-  - SoLoud `bufferingTimeNeeds`
-  - backend `prefetch` sent from client
-- **State resets when switching tabs**: fixed by using `IndexedStack` so Reader isn’t disposed.
+- **Periodic audio gaps**: usually under-buffering. Frontend uses `bufferingTimeNeeds: 1.0` (1 second) for SoLoud buffer.
+- **Audio crackling after long sessions**: Caused by ONNX Runtime session state accumulation. Fixed by periodic session recycling (every ~200 sentences, configurable via `TTS_SESSION_RECYCLE_SENTENCES` env var).
+- **State resets when switching tabs**: fixed by using `IndexedStack` so Reader isn't disposed.
+- **Double quantisation noise**: Fixed by float32-only pipeline. All audio processing (fade, silence) operates on float32; single int16 conversion at send time.
+- **Downloads storage**: FLAC format (lossless, ~3-5x smaller than raw PCM). Legacy `.pcm` files still supported for playback.
 
 ## Files to know
 - Backend:
   - `backend/server.py` (HTTP + WS protocol)
-  - `backend/tts.py` (Kokoro streaming)
+  - `backend/tts.py` (Kokoro streaming, float32 pipeline, session recycling, FLAC encoding)
   - `backend/scraper.py` (NovelCool parsing + chapter index)
   - `backend/download_models.py` (downloads `kokoro-v1.0.onnx` + `voices-v1.0.bin`)
 
 - Frontend:
   - `frontend/lib/screens/reader_screen.dart` (UI, chapter selection, play/pause)
-  - `frontend/lib/services/novel_stream_controller.dart` (WS + SoLoud streaming)
+  - `frontend/lib/services/novel_stream_controller.dart` (WS + SoLoud streaming, FLAC offline playback)
+  - `frontend/lib/services/downloads_controller.dart` (Chapter download + FLAC storage)
   - `frontend/lib/services/settings_store.dart` (Server URL normalization)
 
 ## Design constraints (keep it simple)

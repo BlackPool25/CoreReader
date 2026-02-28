@@ -284,6 +284,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     last_key = None
                     cumulative_samples = 0
                     sample_rate = app.state.tts.sample_rate
+                    # For downloads, accumulate PCM to encode as FLAC at the end.
+                    download_pcm_chunks: list[bytes] = [] if not realtime else []
                     try:
                         control_task: asyncio.Task[str] | None = asyncio.create_task(websocket.receive_text())
 
@@ -358,6 +360,9 @@ async def websocket_endpoint(websocket: WebSocket):
                                 )
                             await websocket.send_bytes(audio_chunk)
                             cumulative_samples += len(audio_chunk) // 2
+                            # Accumulate PCM for FLAC encoding (downloads only).
+                            if not realtime:
+                                download_pcm_chunks.append(audio_chunk)
 
                             # Optional realtime pacing.
                             # - streaming: send roughly in-time to reduce client buffer bloat.
@@ -374,6 +379,37 @@ async def websocket_endpoint(websocket: WebSocket):
 
                         if control_task is not None:
                             control_task.cancel()
+
+                        # For downloads, encode accumulated PCM as FLAC and send.
+                        if not realtime and download_pcm_chunks and not cancel_event.is_set():
+                            try:
+                                all_pcm = b"".join(download_pcm_chunks)
+                                logger.info(
+                                    f"FLAC encode: {len(download_pcm_chunks)} chunks, "
+                                    f"{len(all_pcm)} bytes PCM "
+                                    f"({len(all_pcm)/2/sample_rate:.1f}s audio)"
+                                )
+                                flac_data = app.state.tts.encode_pcm16_to_flac(
+                                    all_pcm, sample_rate=sample_rate
+                                )
+                                is_flac = flac_data[:4] == b"fLaC"
+                                logger.info(
+                                    f"FLAC result: {len(flac_data)} bytes, "
+                                    f"valid_header={is_flac}, "
+                                    f"ratio={len(flac_data)/max(1,len(all_pcm))*100:.1f}%"
+                                )
+                                await websocket.send_json({
+                                    "type": "flac_data",
+                                    "encoding": "flac" if is_flac else "pcm_s16le",
+                                    "size": len(flac_data),
+                                    "sample_rate": sample_rate,
+                                })
+                                await websocket.send_bytes(flac_data)
+                                logger.info("FLAC data sent to client")
+                            except Exception as e:
+                                logger.warning(f"FLAC encoding failed, downloads saved as PCM: {e}")
+                            finally:
+                                download_pcm_chunks.clear()
 
                         await websocket.send_json(
                             {
